@@ -56,7 +56,9 @@ export function showsDate(shown: string, d: Ymd): boolean {
 
 /** The date format a box asks for in its placeholder or hint ("MM/DD/YYYY", "dd-mm-yyyy", "YYYY-MM-DD"), or null when it names none. */
 export function dateFormatOf(text: string): string | null {
-  const m = /\b(mm|dd|yyyy)([\/.-])(mm|dd|yyyy)\2(mm|dd|yyyy)\b/i.exec(text);
+  // Italian "gg-mm-aaaa", French "jj/mm/aaaa" and German "TT.MM.JJJJ" name the same parts in their own letters.
+  const local = text.replace(/\b(gg|jj|tt)(?=[\/.-])/gi, "dd").replace(/(?<=[\/.-])(gg|jj|tt)\b/gi, "dd").replace(/\b(aaaa|jjjj)\b/gi, "yyyy");
+  const m = /\b(mm|dd|yyyy)([\/.-])(mm|dd|yyyy)\2(mm|dd|yyyy)\b/i.exec(local);
   if (!m) return null;
   const parts = [m[1], m[3], m[4]].map((p) => (p as string).toLowerCase());
   return new Set(parts).size === 3 ? parts.join(m[2] as string) : null;

@@ -25,7 +25,7 @@ import { appliedRecords, loadRows, manualRecords, saveRows, toRecord, upsertEntr
 import { loadProfile } from "./profile/schema.js";
 import { setDocumentPolicy, tailorJob } from "./documents/tailor.js";
 import { activeTemplate, addTemplate, listTemplates, useTemplate } from "./documents/templates.js";
-import { addJob, looksLikeUrl } from "./jobs/addJob.js";
+import { addBatchJob, addJob, looksLikeUrl } from "./jobs/addJob.js";
 import { buildReport } from "./report/data.js";
 import { reportPage } from "./report/page.js";
 import { startReportServer } from "./report/server.js";
@@ -100,7 +100,8 @@ async function idsFromLinks(given: string[]): Promise<string[]> {
 /** What this run does about documents: a tailored resume on request, a cover letter on request or when the profile says when_asked. */
 const documentsFromOptions = (o: { tailor?: boolean; cover?: boolean }) => {
   const cover = !!o.cover || loadProfile().preferences.coverLetter === "when_asked";
-  setDocumentPolicy({ resume: !!o.tailor || cover, cover });
+  // A cover letter no longer swaps the candidate's own resume for a tailored one: only --tailor does.
+  setDocumentPolicy({ resume: !!o.tailor, cover });
 };
 
 program
@@ -112,10 +113,24 @@ program
   .option("--fresh", "ignore the answer memory and ask Claude again")
   .option("--tailor", "write a resume for each job from your profile and attach that one instead of your file")
   .option("--cover", "also write a cover letter for a form that has a box for one, as a file or as text")
+  .option("--batch <file>", "apply to the postings of a batch file, one \"tag|url|company|title|city\" line each, in order, on any board")
   .option("--json")
-  .action(async (given: string[], o: ApplyOptions) => {
+  .action(async (given: string[], o: ApplyOptions & { batch?: string }) => {
     documentsFromOptions(o);
     const ids = await idsFromLinks(given);
+    if (o.batch) {
+      const jev = new JevClient();
+      const profile = loadProfile();
+      for (const line of readFileSync(o.batch, "utf8").split(/\r?\n/).filter((l) => l.includes("|"))) {
+        try {
+          const e = await addBatchJob(jev, profile, line);
+          console.log(`${e.job.id}  ${e.job.company} | ${e.job.title}${e.status === "applied" ? "  (already applied)" : ""}`);
+          if (e.status !== "applied") ids.push(e.job.id);
+        } catch (err) {
+          console.log(`batch: ${line.split("|")[0]} not queued: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
     const began = new Date().toISOString();
     const { reports, sent } = await pipeline(takeJobs(ids, { count: o.count, dry: !!o.dry }), { submit: !!o.submit, dry: !!o.dry, fresh: !!o.fresh, quiet: !!o.json });
     if (o.json) console.log(JSON.stringify(reports, null, 2));

@@ -8,6 +8,7 @@ import { fetchGreenhouseBoard, greenhouseJobId, greenhouseSlug } from "../source
 import { fetchLeverBoard, leverJobId, leverSlug } from "../sources/ats/lever.js";
 import type { Profile } from "../profile/schema.js";
 import { canonicalUrl, jobId, type Job } from "./normalize.js";
+import { describe } from "./describe.js";
 import { entryFor, loadQueue, saveQueue, type QueueEntry } from "./queue.js";
 import { rateJob } from "./rate.js";
 
@@ -36,6 +37,31 @@ export async function addJob(jev: JevClient, profile: Profile, url: string): Pro
   const fit = await rateJob(jev, job, profile);
   const entry = { ...entryFor(job, fit, null, previous), status: "queued" as const, statusReason: null };
   q.entries = [entry, ...q.entries.filter((e) => e.job.id !== job.id)];
+  saveQueue(q);
+  return entry;
+}
+
+/**
+ * One posting from a batch line "tag|url|company|title|city", for any board. Greenhouse, Lever and
+ * Ashby links are read and rated as above; any other board is queued from the line itself, with the
+ * page text as its description and no rating.
+ */
+export async function addBatchJob(jev: JevClient, profile: Profile, line: string): Promise<QueueEntry> {
+  const [, url = "", company = "", title = "", city = ""] = line.split("|").map((s) => s.trim());
+  if (!looksLikeUrl(url)) throw new Error(`no link in batch line: ${line}`);
+  try {
+    if (await fetchPosting(url)) return await addJob(jev, profile, url);
+  } catch {
+    /* not a board the tool reads: queued from the line below */
+  }
+  const q = loadQueue();
+  const id = jobId(url);
+  const previous = q.entries.find((e) => e.job.id === id);
+  if (previous?.status === "applied") return previous;
+  const base: Job = { id, source: "batch", company, title, url: canonicalUrl(url), ats: "other", locations: [city ? `${city}, Italy` : "Italy"], postedAt: null, terms: [], sponsorship: "unknown", degrees: [], category: null };
+  const job = await describe(base).catch(() => base);
+  const entry = { ...entryFor(job, null, null, previous), status: "queued" as const, statusReason: null };
+  q.entries = [entry, ...q.entries.filter((e) => e.job.id !== id)];
   saveQueue(q);
   return entry;
 }

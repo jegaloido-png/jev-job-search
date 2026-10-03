@@ -34,6 +34,8 @@ export const DumpedField = z.object({
   section: z.string().default(""),
   /** True when the "radio" is a group of plain buttons rather than input elements. */
   buttonGroup: z.boolean().default(false),
+  /** Set on a second look: the whole list is shown to JEV however long it is, up to FORM.maxOptionsSecondLook. */
+  wholeList: z.boolean().optional(),
 });
 export type DumpedField = z.infer<typeof DumpedField>;
 
@@ -63,9 +65,10 @@ export type FieldsDump = z.infer<typeof FieldsDump>;
  */
 export function isApplicationForm(d: FieldsDump): boolean {
   const asksFile = d.fields.some((f) => f.kind === "file" || /resume|\bcv\b|curriculum/i.test(f.label));
-  const asksName = d.fields.some((f) => /first name|last name|full name|legal name|^(your )?name\b|prénom|\bnom\b/i.test(f.label));
+  const asksName = d.fields.some((f) => /first name|last name|full name|legal name|^(your )?name\b|prénom|\bnom\b|\bnome\b|cognome|vorname|nachname|nombre|apellido/i.test(f.label));
   const asksEmail = d.fields.some((f) => f.kind === "email" || /e-?mail|courriel/i.test(f.label));
-  return asksFile || (asksName && asksEmail);
+  // A file box alone is not a form: a posting page can carry a CV drop zone above its own Apply button.
+  return (asksFile && (d.submitSelectors.length > 0 || asksName || asksEmail)) || (asksName && asksEmail);
 }
 
 export const PlanAction = z.enum([

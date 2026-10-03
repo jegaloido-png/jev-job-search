@@ -203,7 +203,11 @@ export function submitAndRecord(jev: JevClient, id: string, force: boolean, keep
         record(id, r.state === "captcha" || r.state === "login_required" ? "blocked" : "needs_review", `after submit the page was: ${r.state}${r.errors.length ? ` (${r.errors.slice(0, 3).join("; ").slice(0, 160)})` : ""}`);
         if (!keepOpen) await closeJobTab(id);
       } catch (err) {
-        console.log(`${id}  not submitted: ${err instanceof Error ? err.message : String(err)}`);
+        const why = err instanceof Error ? err.message : String(err);
+        console.log(`${id}  not submitted: ${why}`);
+        // Like every other outcome: the job goes on the by-hand list with the reason, and its tab is closed.
+        record(id, "needs_review", `not submitted: ${why.slice(0, 160)}`);
+        if (!keepOpen) await closeJobTab(id).catch(() => undefined);
       }
       return false;
     }),

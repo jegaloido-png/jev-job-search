@@ -10,7 +10,7 @@
  */
 import { FORM, CACHE, PATHS } from "../config.js";
 import { hashOf, KeyedCache } from "../util/cache.js";
-import { isoOf, shapedForBox, toYmd } from "../util/dates.js";
+import { dateFormatOf, isoOf, shapedForBox, toYmd } from "../util/dates.js";
 import type { JevClient } from "../jev/client.js";
 import { choice, noul } from "../jev/questions.js";
 import type { Answer, ChoiceAnswer, NoulAnswer, Questions } from "../jev/types.js";
@@ -25,9 +25,20 @@ import { loadQueue } from "../jobs/queue.js";
 
 const NONE = "__none__";
 
-export function buildFormState(profile: Profile, job: Job, dump: FieldsDump, fields: DumpedField[]): Record<string, unknown> {
+/** Italian places that postings name without the country. */
+const ITALIAN_PLACE = /\b(ital[iy]a?|italian|milan[o]?|rom[ae]|torino|turin|napoli|naples|bologna|firenze|florence|bari|genova|genoa|padova|verona|venezia|venice|brescia|bergamo|parma|modena|trieste|catania|palermo|pisa|monza|treviso|vicenza|ancona|perugia|pescara|lecce)\b/i;
+
+/** The country a posting is in, as far as work authorization goes. */
+export function jobCountry(job: Job, remote = "unknown"): string {
   const tier = locationTier(job.locations);
-  const country = tier === "vancouver" || tier === "canada" ? "Canada" : tier === "us" ? "United States" : tier === "remote" ? "remote (treat as the company's country)" : "unknown";
+  if (tier === "vancouver" || tier === "canada") return "Canada";
+  if (tier === "us") return "United States";
+  if (job.locations.some((l) => ITALIAN_PLACE.test(l))) return "Italy";
+  return tier === "remote" ? remote : "unknown";
+}
+
+export function buildFormState(profile: Profile, job: Job, dump: FieldsDump, fields: DumpedField[]): Record<string, unknown> {
+  const country = jobCountry(job, "remote (treat as the company's country)");
   return {
     page: { url: dump.url, title: dump.title, context: dump.context },
     job: { company: job.company, title: job.title, locations: job.locations, country },
@@ -106,8 +117,8 @@ export function questionsFor(fields: DumpedField[]): Questions {
     const before = fields.slice(Math.max(0, i - 2), i).map((p) => p.label).filter(Boolean);
     const context = before.length ? ` (directly after the fields ${before.map((b) => `"${b.slice(0, 40)}"`).join(" and ")})` : "";
     const title = `Field "${f.label || f.placeholder || f.name}"${section}${context}${f.hint ? ` (${f.hint.slice(0, 120)})` : ""}${f.required ? ", required" : ", optional"}`;
-    if (f.kind === "email" || f.kind === "tel") continue; // fixed by the input type; see planField
-    const restricted = KEYS_BY_KIND[f.kind];
+    if (f.kind === "email" || isPhoneBox(f)) continue; // fixed by the input type; see planField
+    const restricted = KEYS_BY_KIND[f.kind === "tel" ? "number" : f.kind];
     if (restricted) {
       q[f.id] = choice(`${title}, an input of type ${f.kind}: which value should fill it?`, Object.fromEntries(restricted.map((k) => [k, keyCriteria[k] as string])));
     } else if (TEXT_KINDS.has(f.kind)) {
@@ -135,10 +146,10 @@ export function questionsFor(fields: DumpedField[]): Questions {
 
 /** A list JEV can pick from directly: present, and short enough to show whole. */
 export function hasChoosableOptions(f: DumpedField): boolean {
-  return (f.kind === "select" || f.kind === "radio" || f.kind === "combobox") && f.options.length > 0 && f.options.length <= FORM.maxOptionsForJev;
+  return (f.kind === "select" || f.kind === "radio" || f.kind === "combobox") && f.options.length > 0 && f.options.length <= (f.wholeList ? FORM.maxOptionsSecondLook : FORM.maxOptionsForJev);
 }
 
-const SALARY_LABEL = /salary|compensation|desired pay|expected pay|pay (rate|range|expectation)|hourly rate|wage/i;
+const SALARY_LABEL = /salary|compensation|desired pay|expected pay|pay (rate|range|expectation)|hourly rate|wage|stipendio|retribuzione|\bral\b|gehalt|salaire|salario/i;
 
 const EDUCATION_NEIGHBOUR = /school|university|college|degree|field of study|major|education|graduat|start date|end date/i;
 const DATE_LABEL = /^(start|end)\s*(date|month|year)?$/i;
@@ -350,16 +361,33 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
   };
 }
 
+/**
+ * A tel input is the phone number, except when its label names something else: some boards (HiBob)
+ * use type tel for any digits-only box, such as the desired salary.
+ */
+const isPhoneBox = (f: DumpedField) => f.kind === "tel" && !(SALARY_LABEL.test(f.label) || /stipendio|retribuzione|\bral\b|years|anni|\bage\b|amount|importo/i.test(f.label));
+
 export function planField(f: DumpedField, answer: Answer | undefined, profile: Profile, job: Job): PlannedField {
   const base = { id: f.id, selector: f.selector, kind: f.kind, label: f.label, required: f.required, optionLabel: null as string | null };
   if (f.kind === "email") return { ...base, action: "fill", key: "email", value: profile.email, confidence: 1, note: null };
-  if (f.kind === "tel") {
+  if (isPhoneBox(f)) {
     // National digits unless the placeholder or hint shows an international format.
-    const intl = /\+\d|country code|international/i.test(`${f.placeholder} ${f.hint}`);
+    // Outside North America the number goes in with its country code: European boards (TalentLyft) refuse bare national digits.
+    const northAmerica = ["United States", "Canada"].includes(jobCountry(job));
+    const intl = !northAmerica || /\+\d|country code|international/i.test(`${f.placeholder} ${f.hint}`);
     return { ...base, action: "fill", key: intl ? "phone_with_country_code" : "phone", value: intl ? `${profile.phone.countryCode}${profile.phone.national}` : profile.phone.national, confidence: 1, note: null };
   }
   if (SIGNATURE_LABEL.test(f.label)) return { ...base, action: "review", key: "signature", value: null, confidence: 1, note: "signing an agreement is for the candidate to do" };
   if (isSlotChoice(f)) return { ...base, action: "review", key: "schedule", value: null, confidence: 1, note: "choosing a date or a time slot is for the candidate to do" };
+  // "I currently work here" in a work entry, "currently studying here" in an education entry: the profile says it outright.
+  if (f.kind === "checkbox" && CURRENT_JOB.test(f.label)) {
+    const now = profile.experience[0]?.current ?? false;
+    return now ? { ...base, action: "fill", key: "experience_current", value: "true", confidence: 1, note: null } : { ...base, action: "skip", key: "experience_current", value: null, confidence: 1, note: "left unchecked" };
+  }
+  if (f.kind === "checkbox" && CURRENT_STUDY.test(f.label)) {
+    const now = profile.education[0]?.status === "in_progress";
+    return now ? { ...base, action: "fill", key: "currently_enrolled", value: "true", confidence: 1, note: null } : { ...base, action: "skip", key: "currently_enrolled", value: null, confidence: 1, note: "left unchecked" };
+  }
   if (!answer) return { ...base, action: "review", key: "unknown", value: null, confidence: 0, note: "no answer" };
 
   if (f.kind === "checkbox") {
@@ -391,6 +419,11 @@ export function planField(f: DumpedField, answer: Answer | undefined, profile: P
   a = { ...a, confidence };
   const note = a.confidence < FORM.autoConfidence ? `confidence ${a.confidence.toFixed(2)}` : null;
   const textLike = f.kind === "text" || f.kind === "textarea";
+  // A required salary box that takes digits only gets the candidate's own figure as digits ("25.000 EUR" as 25000).
+  const ownFigure = (profile.preferences.salaryExpectation || profile.preferences.salaryIfRequired || "").match(/\d[\d.,' ]*\d|\d/)?.[0].replace(/[.,' ]/g, "");
+  if (f.required && (f.kind === "tel" || f.kind === "number") && SALARY_LABEL.test(f.label) && ownFigure) {
+    return { ...base, action: "fill", key: "salary_expectation", value: ownFigure, confidence: 1, note: "the candidate's own salary figure, as digits" };
+  }
   // A salary box that will not submit empty gets the profile's standing wording, never a number the candidate did not give.
   if (f.required && textLike && SALARY_LABEL.test(f.label) && !profile.preferences.salaryExpectation && (key === "salary_expectation" || key === "leave_blank" || key === "unknown" || key === "free_text")) {
     return { ...base, action: "fill", key: "salary_expectation", value: profile.preferences.salaryIfRequired, confidence: a.confidence, note: "salary is required, so the standing wording is used" };
@@ -413,12 +446,34 @@ export function planField(f: DumpedField, answer: Answer | undefined, profile: P
       if (key === "gpa") return { ...base, action: f.required ? "fill" : "skip", key, value: f.required ? gpaValue(profile) : null, confidence: a.confidence, note: f.required ? "GPA given only because the field is required" : "GPA not volunteered" };
       return { ...base, action: f.required ? "review" : "skip", key, value: null, confidence: a.confidence, note: f.required ? "required but the profile has no value" : null };
     }
+    // A link to a site's front page ("https://linkedin.com") names no profile: it stands in only where a link is
+    // required. An optional box is left empty, and boards that check the link (SmartRecruiters) refuse it.
+    if (/_url$/.test(key) && !f.required && /^https?:\/\/[^/]+\/?$/i.test(value.trim())) {
+      return { ...base, action: "skip", key: "leave_blank", value: null, confidence: a.confidence, note: "optional, and the profile's link names no profile" };
+    }
     if (f.kind === "calendar") {
       // A calendar takes a day. A value that names only a month is its first day; anything that is not a date goes to Claude.
       const day = toYmd(value);
       if (!day) return { ...base, action: "review", key, value: null, confidence: a.confidence, note: "the calendar needs a date, and the profile's value is not one" };
       return { ...base, action: "fill", key, value: isoOf(day), confidence: a.confidence, note };
     }
+    // A start date written as words ("Immediatamente (preavviso 2 settimane)") goes into a date box as the day it names.
+    if (key === "earliest_start_date" && TEXT_KINDS.has(f.kind) && !toYmd(value) && dateFormatOf(`${f.placeholder} ${f.hint}`)) {
+      const day = startDayOf(value, new Date());
+      if (day) return { ...base, action: "fill", key, value: shapedForBox(day, `${f.placeholder} ${f.hint}`), confidence: a.confidence, note: `"${value}" as a date` };
+    }
+    // A date picker that names no format ("Pick date...") is typed the day as yyyy-mm-dd, which reads one way only;
+    // the picker rewrites it in its own format (Ashby: "10/07/2026").
+    if (key === "earliest_start_date" && TEXT_KINDS.has(f.kind) && PICK_A_DATE.test(f.placeholder.trim())) {
+      const day = toYmd(value) ? isoOf(toYmd(value)!) : startDayOf(value, new Date());
+      if (day) return { ...base, action: "fill", key, value: day, confidence: a.confidence, note: `"${value}" as a date` };
+    }
+    // A box that asks only for the year of a date ("Anno di nascita", a number box) takes the year.
+    const whole = TEXT_KINDS.has(f.kind) ? toYmd(value) : null;
+    if (whole && (f.kind === "number" || YEAR_ONLY.test(f.label))) return { ...base, action: "fill", key, value: String(whole.year), confidence: a.confidence, note };
+    // A date picker box that names no format ("Pick a date") takes a month and year as digits: "01/2022".
+    const d = MONTH_YEAR_KEYS.has(key) && TEXT_KINDS.has(f.kind) && PICK_A_DATE.test(f.placeholder.trim()) ? toYmd(value) : null;
+    if (d) return { ...base, action: "fill", key, value: `${String(d.month).padStart(2, "0")}/${d.year}`, confidence: a.confidence, note };
     // A text box that names a date format gets the date written that way: typed as "May 2027", a masked box keeps "02/27/".
     return { ...base, action: "fill", key, value: TEXT_KINDS.has(f.kind) ? shapedForBox(value, `${f.placeholder} ${f.hint}`) : value, confidence: a.confidence, note };
   }
@@ -427,15 +482,54 @@ export function planField(f: DumpedField, answer: Answer | undefined, profile: P
 
 /** Which document a file box asks for, from its question, its name and its hint. The resume is never put in a box that asks for something else. */
 /** A box that asks for a cover letter, as a file or as text. */
-export const COVER_LABEL = /cover\s*letter|covering letter|letter of (motivation|interest|application)|motivation letter/i;
+/** A box ticked when the job in a work entry is the candidate's current one. */
+const CURRENT_JOB = /currently (work|working) (here|there)|current (job|position|role|employer)|i still work|lavoro (qui )?attualmente|attualmente (lavoro|impiegat)|posizione attuale|ich arbeite (hier )?derzeit|aktuelle (stelle|position)|j'occupe actuellement|poste actuel|trabajo aqu[ií] actualmente|trabajo actual/i;
+/** A box ticked when the school in an education entry is still being attended. */
+const CURRENT_STUDY = /currently (study|studying|enrolled|attend)|still (studying|enrolled)|attualmente (studio|iscritt)|in corso di studi|studiere derzeit|j'[ée]tudie actuellement|estudio actualmente/i;
 
-export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "selector">): "resume" | "cover" | "transcript" | "graduate_transcript" | "autofill" | "other" | "unnamed" {
+/**
+ * The day a start written in words falls on, as yyyy-mm-dd: "immediately", "subito", or a notice period ("2 weeks",
+ * "preavviso 2 settimane", "1 mese") counted from today. Null when the words name no such day.
+ */
+export function startDayOf(words: string, today: Date): string | null {
+  const w = words.toLowerCase();
+  const n = (re: RegExp) => Number(re.exec(w)?.[1] ?? NaN);
+  const days = n(/(\d+)\s*(giorn|day|tag|jour|d[ií]a)/), weeks = n(/(\d+)\s*(settiman|week|woche|semaine|semana)/), months = n(/(\d+)\s*(mes|month|monat|mois)/);
+  const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  if (!Number.isNaN(months)) d.setMonth(d.getMonth() + months);
+  else if (!Number.isNaN(weeks)) d.setDate(d.getDate() + weeks * 7);
+  else if (!Number.isNaN(days)) d.setDate(d.getDate() + days);
+  else if (!/immediat|subito|asap|right away|sofort|imm[ée]diatement|inmediat/.test(w)) return null;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** A box that asks only for a year: "Anno di nascita", "Year of birth", "Graduation year". */
+const YEAR_ONLY = /^\s*(anno|year|jahr|ann[ée]e|año|ano)\b|\b(anno|year|jahr|ann[ée]e|año)\s*(di|of|de|der|du)?\s*(nascita|birth|geburt|naissance|nacimiento|laurea|graduation|diploma)\b/i;
+
+/** Profile dates that name only a month and a year. */
+const MONTH_YEAR_KEYS = new Set(["education_start_date", "graduation_date", "experience_start_date", "experience_end_date"]);
+/** The placeholder of a date picker that names no format of its own. */
+const PICK_A_DATE = /^(pick|select|choose|enter|seleziona|scegli|inserisci|wähle|choisir|elige|selecciona)\s+(a |an |una |un |eine |une )?(date|data|datum|fecha)\s*(\.{1,3}|…)?$/i;
+
+export const COVER_LABEL = /cover\s*letter|covering letter|letter of (motivation|interest|application)|motivation letter|anschreiben|motivationsschreiben|lettera di (presentazione|motivazione|accompagnamento)|lettre de motivation|carta de presentaci[oó]n/i;
+
+export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "selector"> & { accept?: string }): "resume" | "cover" | "transcript" | "graduate_transcript" | "autofill" | "other" | "unnamed" {
   const text = `${f.label} ${f.name} ${f.hint} ${f.selector}`;
-  if (/autofill|auto-fill|parse|prefill/i.test(text)) return "autofill";
-  if (COVER_LABEL.test(text)) return "cover";
+  // SmartRecruiters' "apply with your resume" box reads the file and writes what it finds over the form.
+  if (/autofill|auto-fill|parse|prefill|apply[-_ ]with[-_ ](your[-_ ])?resume/i.test(text)) return "autofill";
+  // A box that takes only pictures is a photo box, whatever its words ("Carica immagine del profilo").
+  const accept = (f.accept ?? "").trim();
+  if (accept && /image|\.(jpe?g|png|gif|webp|heic|bmp)\b/i.test(accept) && !/pdf|\.docx?\b|application\//i.test(accept)) return "other";
+  if (/\b(immagine|foto|photo|picture|image|bild|avatar)\b/i.test(f.label) && !/resume|\bcv\b|curriculum/i.test(f.label)) return "other";
+  // The box's own question decides first. One box that asks for the resume and the cover letter together
+  // (Cornerstone: "Please upload your resume and cover letter") gets the resume, which no application goes without.
+  const RESUME = /resume|résumé|\bcv\b|curriculum|lebenslauf/i;
+  if (COVER_LABEL.test(f.label) && !RESUME.test(f.label)) return "cover";
+  if (RESUME.test(f.label) && !COVER_LABEL.test(f.label)) return "resume";
+  if (COVER_LABEL.test(text) && !RESUME.test(text)) return "cover";
   if (/transcript/i.test(text)) return /\b(graduate|master|phd|doctoral)\b/i.test(text) && !/undergraduate/i.test(text) ? "graduate_transcript" : "transcript";
-  if (/resume|résumé|\bcv\b|curriculum/i.test(text)) return "resume";
-  if (/cover|letter|portfolio|photo|picture|certificate|writing sample|work sample|reference|other|additional/i.test(text)) return "other";
+  if (RESUME.test(text)) return "resume";
+  if (/cover|letter|portfolio|photo|picture|certificate|writing sample|work sample|reference|other|additional|supplementar|aggiuntiv|ulterior|altri (documenti|allegati|file)|certificat|attestat|zusätzlich|weitere|supplémentaire|adicional/i.test(text)) return "other";
   return "unnamed";
 }
 
@@ -456,9 +550,7 @@ function gpaValue(profile: Profile): string | null {
 export function valueForJob(profile: Profile, job: Job, key: FieldKey): string | null {
   if (isSpecialKey(key)) return null;
   if (key === "authorized_to_work" || key === "requires_sponsorship") {
-    const tier = locationTier(job.locations);
-    const country = tier === "vancouver" || tier === "canada" ? "Canada" : tier === "us" ? "United States" : "unknown";
-    const auth = authForCountry(profile, country);
+    const auth = authForCountry(profile, jobCountry(job));
     return key === "authorized_to_work" ? auth.authorized : auth.requires_sponsorship;
   }
   return valueFor(profile, key);

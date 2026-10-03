@@ -16,7 +16,7 @@
 
   for (const f of fills) {
     try {
-      const el = document.querySelector(f.selector);
+      const el = window.__awj && window.__awj.q ? window.__awj.q(f.selector) : document.querySelector(f.selector);
       if (!el) { report.failed.push({ selector: f.selector, why: "not found" }); continue; }
       el.scrollIntoView({ block: "center" });
       if (f.kind === "select") {
@@ -26,9 +26,13 @@
         fire(el, ["input", "change"]);
       } else if (f.kind === "radio" && el.tagName !== "INPUT") {
         // A button group: click the button whose text matches.
-        const buttons = [...el.querySelectorAll("button, [role=radio], [role=option]")];
+        // A web component's group takes its options through a <slot>: those count as its own.
+        const slotted = [...el.querySelectorAll("slot")].flatMap((sl) => sl.assignedElements({ flatten: true }).flatMap((n) => [n, ...n.querySelectorAll("*")]));
+        const buttons = [...new Set([...el.querySelectorAll("button, [role=radio], [role=option]"), ...slotted.filter((n) => n.matches("button, [role=radio], [role=option]"))])];
         const want = norm(f.value);
-        const btn = buttons.find((b) => norm(b.innerText || b.textContent) === want) || buttons.find((b) => norm(b.innerText || b.textContent).includes(want));
+        // An option drawn by a web component (<spl-radio label="Sì">) keeps its words on itself or in its shadow root.
+        const words = (b) => norm(b.innerText || b.textContent || b.getAttribute("label") || b.getAttribute("aria-label") || (b.shadowRoot ? b.shadowRoot.textContent : ""));
+        const btn = buttons.find((b) => words(b) === want) || buttons.find((b) => words(b).includes(want));
         if (!btn) { report.failed.push({ selector: f.selector, why: "button option not found: " + f.value }); continue; }
         // A row drawn around a real radio or checkbox: the box is what the form listens to.
         (btn.querySelector("input[type=radio], input[type=checkbox]") || btn).click();

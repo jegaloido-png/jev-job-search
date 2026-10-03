@@ -1,0 +1,56 @@
+// Lifein probe: open the posting, press Apply, give the CV, then open the address panel and read its boxes.
+import fs from "node:fs";
+const url = process.argv[2];
+const t = await fetch("http://127.0.0.1:9333/json/new?" + encodeURIComponent(url), { method: "PUT" }).then((r) => r.json());
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+await new Promise((r) => (ws.onopen = r));
+let id = 0;
+const send = (method, params = {}) => new Promise((res) => { const my = ++id; ws.addEventListener("message", function h(ev) { const m = JSON.parse(ev.data); if (m.id === my) { ws.removeEventListener("message", h); res(m.result ?? m.error); } }); ws.send(JSON.stringify({ id: my, method, params })); });
+const ev = async (expression) => (await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })).result?.value;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const helpers = fs.readFileSync("src/forms/pageHelpers.js", "utf8");
+const click = async (p) => { for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) await send("Input.dispatchMouseEvent", { type, x: p.x, y: p.y, button: "left", clickCount: 1 }); };
+await send("Page.setInterceptFileChooserDialog", { enabled: true });
+await send("DOM.enable");
+await sleep(4000);
+await ev(helpers);
+const ap = await ev(`window.__awj.clickByText(${JSON.stringify("^\s*candidati.{0,45}$")})`);
+await click(ap); await sleep(2000);
+const obj = (await send("Runtime.evaluate", { expression: "document.querySelector('input[type=file]')" })).result.objectId;
+await send("DOM.setFileInputFiles", { objectId: obj, files: ["C:/Users/corna/Desktop/jev-job-search/data/resume/cv-it.pdf"] });
+await sleep(9000);
+await ev(helpers);
+const dobSel0 = "#" + (await ev(`document.querySelector('[id^=field_field_][id$=value_]').id`));
+await ev(`(() => { const e = document.querySelector(${JSON.stringify(dobSel0)}); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(e, '25-06-2004'); e.dispatchEvent(new Event('input', {bubbles:true})); e.dispatchEvent(new Event('change', {bubbles:true})); e.blur(); })()`);
+await sleep(500);
+const dobNow = async (tag) => console.log("DOB", tag, JSON.stringify(await ev(`document.querySelector(${JSON.stringify(dobSel0)}).value`)));
+await dobNow("after set");
+const trig = "#" + (await ev(`document.querySelector('[id$=geolocation-trigger]').id`));
+console.log("trigger", trig);
+const p = await ev(`window.__awj.point(${JSON.stringify(trig)})`);
+await click(p); await sleep(1500);
+await dobNow("after panel open");
+const boxes = await ev(`window.__awj.panelBoxes(${JSON.stringify(trig)})`);
+console.log("boxes", JSON.stringify(boxes));
+const cap = boxes.find((b) => /cap|citt/i.test(b.label));
+console.log("focus", await ev(`window.__awj.focus(${JSON.stringify(cap.selector)})`), await ev(`document.activeElement.id`));
+await ev(`window.__awj.selectAll()`);
+for (const ch of "70121") { await send("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch }); await send("Input.dispatchKeyEvent", { type: "keyUp", key: ch }); }
+await sleep(2500);
+const shot = async (name) => fs.writeFileSync(`data/${name}.png`, Buffer.from((await send("Page.captureScreenshot", { format: "png" })).data, "base64"));
+await shot("probe-1-typed");
+const rows = await ev(`window.__awj.suggestions("70121")`);
+console.log("rows", JSON.stringify(rows));
+console.log("cap value", await ev(`document.querySelector(${JSON.stringify(cap.selector)}).value`));
+const row = rows.find((r) => /70121/.test(r.label));
+if (row) { const again = (await ev(`window.__awj.suggestions("70121")`)).find((r) => r.label === row.label); await click(again); await sleep(1500); }
+await shot("probe-2-picked");
+await dobNow("after pick");
+console.log("trigger shows", await ev(`window.__awj.shown(${JSON.stringify(trig)})`));
+// Date of birth the way fillFields sets it: value plus input and change events.
+const dobSel = "#" + (await ev(`document.querySelector('[id^=field_field_][id$=value_]').id`));
+await ev(`(() => { const e = document.querySelector(${JSON.stringify(dobSel)}); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(e, '25-06-2004'); e.dispatchEvent(new Event('input', {bubbles:true})); e.dispatchEvent(new Event('change', {bubbles:true})); e.blur(); })()`);
+await sleep(800);
+console.log("dob after script", await ev(`document.querySelector(${JSON.stringify(dobSel)}).value`), "| hidden", await ev(`document.querySelector('[id$=value___cal]')?.value`));
+await shot("probe-3-dob");
+await send("Page.close");

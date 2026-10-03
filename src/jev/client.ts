@@ -47,12 +47,14 @@ export class JevClient {
   readonly usage: Usage = { calls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
 
   constructor(opts: JevClientOptions = {}) {
-    const key = opts.apiKey ?? process.env.OPENROUTER_API_KEY;
-    if (!key) throw new JevError("OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key.");
+    // Without an OpenRouter key, a TypeSafe key reaches JEV directly: same request and answer shape.
+    const typesafe = !opts.apiKey && !process.env.OPENROUTER_API_KEY && !!process.env.TYPESAFE_API_KEY;
+    const key = opts.apiKey ?? process.env.OPENROUTER_API_KEY ?? process.env.TYPESAFE_API_KEY;
+    if (!key) throw new JevError("OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not set. Copy .env.example to .env and add your key.");
     this.apiKey = key;
     this.fetchImpl = opts.fetchImpl ?? ((input, init) => fetch(input, init));
-    this.endpoint = opts.endpoint ?? JEV.endpoint;
-    this.model = opts.model ?? JEV.model;
+    this.endpoint = opts.endpoint ?? process.env.JEV_ENDPOINT ?? (typesafe ? JEV.typesafeEndpoint : JEV.endpoint);
+    this.model = opts.model ?? process.env.JEV_MODEL ?? (typesafe ? JEV.typesafeModel : JEV.model);
     this.spendCapUsd = opts.spendCapUsd ?? JEV.runSpendCapUsd;
     this.usageLog = opts.usageLog === undefined ? PATHS.jevUsage : opts.usageLog;
     this.siteUrl = opts.siteUrl ?? process.env.OPENROUTER_SITE_URL;

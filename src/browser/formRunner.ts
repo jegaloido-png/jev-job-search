@@ -8,7 +8,7 @@
 import path from "node:path";
 import { BROWSER, FORM, MEMORY, RUN } from "../config.js";
 import { isApplicationForm, type DumpedField, type FieldsDump, type FillPlan } from "../forms/fields.js";
-import { hasChoosableOptions, mapForm } from "../forms/mapForm.js";
+import { hasChoosableOptions, mapForm, startDayOf } from "../forms/mapForm.js";
 import { decidePageState } from "../forms/pageState.js";
 import type { JevClient } from "../jev/client.js";
 import { applyUrlFor, greenhouseFallbackUrl, type Job } from "../jobs/normalize.js";
@@ -20,21 +20,50 @@ import { closeTab, ensureBrowser, newTab, Page, sleep } from "./cdp.js";
 import { candidateOptions, closestOptions, readDropdownOptions } from "./dropdowns.js";
 import { applyFills, TYPED_KINDS, uploadFile, type FillGuide } from "./fill.js";
 import { learn, notesFor, signatureOf, type Method } from "../knowledge/sites.js";
-import { showsValue } from "../util/dates.js";
+import { showsValue, toYmd } from "../util/dates.js";
+import { declineCookieBanner } from "./submit.js";
 import { blockedReport, comparePages, emptyRequired, emptyRequiredFields, isClean, isReady, loadPlan, loadReport, pickNext, savePlan, saveReport, SIGN_IN_REASON, splitFailures, type Failure, type FieldReport, type Fill, type FillReport } from "./report.js";
 import { controlStates, dump, goto, inFront, inTurn, install, loadSession, pageFor, saveSession, settle, shownValues, trace, type Point } from "./session.js";
 
 /** The text of a button that leads from a posting to its form. */
-const APPLY_BUTTON = "^\\s*(apply|apply now|apply for this job|apply to this job|apply for this position|start application|i'm interested)\\s*[»›→>]*\\s*$";
+// A short label that starts with an apply verb: "Apply for this job", "Candidati per questo ruolo", "Candidarsi alla
+// posizione", "Jetzt bewerben". Italian, German, French, Spanish, Portuguese and Dutch boards (Teamtailor, Personio,
+// Breezy, Manatal, Recruitee) label it in the posting's language. Apply-with-LinkedIn and other autofill helpers are left alone.
+// Some labels put the verb last ("Auf diese Stelle bewerben") or after a short lead-in ("Presenta candidatura per la
+// posizione", "Invia la domanda di lavoro"), and HiBob names its form tab just "Application". SmartRecruiters says
+// "I'm interested" in the posting's language ("Mi interessa", "Ich bin interessiert", "Me interesa").
+const APPLY_BUTTON =
+  "^\\s*(?!.*(linkedin|indeed|xing|google|facebook|seek|later|share|condividi))" +
+  "((apply|start (your )?application|submit (your )?application|i'm interested|i am interested|" +
+  "mi interessa|sono interessat[oa]|ich bin interessiert|je suis intéressée?|ça m'intéresse|me interesa|estoy interesad[oa]|tenho interesse|estou interessad[oa]|ik ben geïnteresseerd|" +
+  "candidati|candidarsi|candidatati|candidatura|invia (la tua |la )?candidatura|invia (il tuo )?cv|inviaci il tuo cv|applica|" +
+  "presenta (la )?(tua )?candidatura|invia (la )?(tua )?domanda|fai domanda|" +
+  "bewerben|jetzt bewerben|postuler|aplicar|inscribirse|candidatar|solliciteer|prijavi se|aplikuj)\\b.{0,45}|" +
+  "application|.{0,30}\\bbewerben|.{0,30}\\bbewirb dich( jetzt)?)\\s*$";
+
+/**
+ * The consent page some boards put between a posting and its form (Jobvite's "Application for Employment":
+ * personal data for recruiting, "I Accept" / "I Decline"). It belongs to the application, like a required
+ * privacy box, so it is accepted. A cookie banner never matches: its buttons say "accept all" or "accetta tutti".
+ */
+const APPLICATION_CONSENT = "^\\s*(i accept|i agree|accetto|acconsento|ich stimme zu|j'accepte)\\s*$";
+const CONSENT_PAGE = /personal data|dati personali|personenbezogene|données personnelles/i;
 
 /** Lands on the page that holds the form: the URL itself, an embedded ATS frame, or behind an Apply button. */
-async function openForm(page: Page, job: Job): Promise<FieldsDump> {
+async function openForm(page: Page, job: Job, resume?: string): Promise<FieldsDump> {
   await goto(page, applyUrlFor(job));
   let d = await dump(page);
-  for (let hop = 0; hop < 3 && !isApplicationForm(d); hop++) {
+  // A cookie banner over the Apply button takes its click, so it is answered first too.
+  if (!isApplicationForm(d) || (await formFolded(page, d))) d = await declineCookies(page, d);
+  for (let hop = 0; hop < 4 && (!isApplicationForm(d) || (await formFolded(page, d))); hop++) {
     const frame = d.frames[0];
+    const consent = !frame && CONSENT_PAGE.test(await page.evaluate<string>("window.__awj.pageText()")) ? await page.awj<Point>("clickByText", APPLICATION_CONSENT) : null;
     if (frame) {
       await goto(page, frame);
+    } else if (consent?.ok) {
+      await page.click(consent.x, consent.y);
+      await settle(page);
+      await install(page);
     } else {
       const p = await page.awj<Point>("clickByText", APPLY_BUTTON);
       if (!p.ok) break;
@@ -45,9 +74,12 @@ async function openForm(page: Page, job: Job): Promise<FieldsDump> {
         await page.click(p.x, p.y);
         await settle(page);
         await install(page);
+        // A form that unfolds in place animates open; read it once it has stopped moving.
+        await unfolded(page);
       }
     }
     d = await dump(page);
+    trace(`open hop ${hop}: ${frame ? "frame" : consent?.ok ? "consent" : "apply button"}, ${d.fields.length} fields, form=${isApplicationForm(d)}`);
   }
   // A careers page that shows the job without the form: go to the board's own form for the same posting.
   const fallback = !isApplicationForm(d) && !d.hasPassword ? greenhouseFallbackUrl(job) : null;
@@ -55,8 +87,90 @@ async function openForm(page: Page, job: Job): Promise<FieldsDump> {
     await goto(page, fallback);
     d = await dump(page);
   }
+  d = await declineCookies(page, d);
+  if (resume && !isApplicationForm(d) && d.fields.length === 1 && d.fields[0]?.kind === "file" && !(await formFolded(page, d))) d = await resumeFirst(page, d, resume);
+  if (isApplicationForm(d) && (await page.awj<number>("exposeFileButtons")) > 0) d = await dump(page);
   return d;
 }
+
+/**
+ * A form that asks for the resume before anything else (inRecruiting's "carica il CV per registrarti"): it reads
+ * the file and only then shows its fields, filled from it. The candidate's resume is given and the form waited for.
+ */
+async function resumeFirst(page: Page, d: FieldsDump, resume: string): Promise<FieldsDump> {
+  const box = d.fields[0];
+  if (!box) return d;
+  trace(`only a resume box on the page: uploading ${path.basename(resume)} to bring up the form`);
+  if (await uploadFile(page, box.selector, resume)) return d;
+  await page.call("function (s) { document.documentElement.setAttribute('data-awj-resume-given', s); }", box.selector);
+  const deadline = Date.now() + BROWSER.settleMs;
+  while (Date.now() < deadline) {
+    await sleep(BROWSER.pollMs * 4);
+    await install(page);
+    const now = await dump(page);
+    if (now.fields.length > d.fields.length && isApplicationForm(now)) {
+      // The site is still writing what it read from the file into the form ("Importando i dati"). Anything typed
+      // before it finishes is overwritten, so wait until the form has held still for a few looks in a row.
+      let last = "";
+      let still = 0;
+      let settled = now;
+      while (still < 4 && Date.now() < deadline) {
+        await sleep(BROWSER.pollMs * 4);
+        settled = await dump(page);
+        const sig = settled.fields.map((f) => `${f.label}=${f.value}`).join("|") + (await page.evaluate<string>("window.__awj.pageText()")).length;
+        still = sig === last ? still + 1 : 0;
+        last = sig;
+      }
+      trace(`form brought up by the resume held still after ${Math.round((Date.now() - deadline + BROWSER.settleMs) / 100) / 10}s`);
+      return settled;
+    }
+  }
+  return dump(page);
+}
+
+/**
+ * A form folded away under the posting until Apply is pressed (inRecruiting): its file box is in the dump,
+ * since file boxes are always hidden, but the form around it takes no room on the page yet.
+ */
+async function formFolded(page: Page, d: FieldsDump): Promise<boolean> {
+  const files = d.fields.filter((f) => f.kind === "file");
+  if (!files.length || files.length < d.fields.length) return false;
+  return page.evaluate<boolean>(
+    `${JSON.stringify(files.map((f) => f.selector))}.every((s) => { const el = window.__awj.q(s); const box = el && (el.closest("form") || el.parentElement?.parentElement); return !!box && box.getBoundingClientRect().height === 0; })`,
+  );
+}
+
+/** Waits until no element is mid-animation and the page's height stops changing, at most a few seconds. */
+async function unfolded(page: Page): Promise<void> {
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    await sleep(BROWSER.pollMs);
+    const h = await page.evaluate<number>(`document.querySelector(".collapsing, .animating, [class*='-enter-active']") ? -2 : document.documentElement.scrollHeight`);
+    if (h >= 0 && h === last) return;
+    last = h;
+  }
+}
+
+/**
+ * A European cookie banner can sit over the form and keep its boxes from taking focus. It is answered
+ * with its most private choice, as at Submit; never "accept all".
+ */
+async function declineCookies(page: Page, d: FieldsDump): Promise<FieldsDump> {
+  if (!(await inFront(page, () => declineCookieBanner(page)))) return d;
+  await settle(page);
+  return dump(page);
+}
+
+/** A posting that sends the browser to the ATS vendor's own home page (Personio does) has been taken down. */
+const removedPosting = (job: Job, url: string) => {
+  try {
+    const from = new URL(applyUrlFor(job));
+    const to = new URL(url);
+    return to.hostname !== from.hostname && to.pathname.replace(/\/+$/, "") === "" && from.pathname.length > 1;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Opens a job's form in a tab of its own and fills its first page. A sign-in page, a page with no
@@ -74,7 +188,7 @@ export async function fillJob(jev: JevClient, profile: Profile, job: Job): Promi
   const page = await Page.attach(target);
   const seconds = () => (Date.now() - started) / 1000;
   try {
-    let d = await openForm(page, job);
+    let d = await openForm(page, job, profile.resume.path);
     trace(`${job.company}: form open ${Date.now() - started}ms, ${d.fields.length} fields`);
     // Read and written in one synchronous step, so jobs filled side by side do not overwrite each other.
     saveSession({ ...loadSession(), [job.id]: { targetId: target.id, url: d.url } });
@@ -84,11 +198,12 @@ export async function fillJob(jev: JevClient, profile: Profile, job: Job): Promi
       if (first.state === "error" || first.state === "other") {
         trace(`${job.company}: page looked like ${first.state}, retrying in ${BROWSER.retryAfterMs}ms`);
         await sleep(BROWSER.retryAfterMs);
-        d = await openForm(page, job);
+        d = await openForm(page, job, profile.resume.path);
       }
     }
     // A password box means a sign-in or account page. Nothing is typed into it. The job is left for the person.
     if (d.hasPassword) return saveReport(blockedReport(job, SIGN_IN_REASON, d.url, seconds()));
+    if (!isApplicationForm(d) && removedPosting(job, d.url)) return saveReport(blockedReport(job, "no form found, page looks like: closed", d.url, seconds()));
     if (!isApplicationForm(d)) {
       const state = await decidePageState(jev, await page.evaluate<string>("window.__awj.pageText()"), d.url, job.id);
       return saveReport(blockedReport(job, `no form found, page looks like: ${state.state}`, d.url, seconds()));
@@ -99,8 +214,60 @@ export async function fillJob(jev: JevClient, profile: Profile, job: Job): Promi
   }
 }
 
+/**
+ * A required section the form fills one entry at a time ("Experience *", an Add button, "Please provide at least one
+ * work experience entry"). Its Add is pressed, the entry's own fields are read, mapped and filled from the profile like
+ * any other, and the entry is kept with its own Save. One entry per section: the candidate's latest.
+ */
+async function addEntries(page: Page, jev: JevClient, profile: Profile, job: Job, d: FieldsDump): Promise<FieldsDump> {
+  for (let round = 0; round < FORM.maxEntrySections; round++) {
+    const add = (await page.awj<(Point & { section: string })[]>("entryAdds"))[0];
+    if (!add?.ok) break;
+    const before = new Set(d.fields.map((f) => f.selector));
+    await inFront(page, () => page.click(add.x, add.y));
+    await sleep(BROWSER.pollMs * 4);
+    await settle(page);
+    const opened = await dump(page);
+    const fresh = opened.fields.filter((f) => !before.has(f.selector));
+    trace(`${job.company}: entry for "${add.section.slice(0, 50)}", ${fresh.length} field(s)`);
+    const first = fresh[0];
+    if (!first) return opened;
+    const entry = { ...opened, fields: fresh };
+    await readDropdownOptions(page, entry.fields);
+    const plan = await mapForm(jev, profile, job, entry);
+    trace(`${job.company}: entry plan: ${plan.fields.map((f) => `${f.label.slice(0, 20)}=${f.action}:${String(f.value ?? "").slice(0, 20)}`).join(" | ")}`);
+    const unset = await applyFills(page, plan.fills, profile, guideFor(entry));
+    if (unset.length) trace(`${job.company}: entry fields not set: ${unset.map((f) => f.why).join("; ").slice(0, 200)}`);
+    // A suggestion list left open takes the first click as a click away from it, so lists are closed first, and the
+    // Save is pressed once more when the entry is still open.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await inFront(page, async () => {
+        await page.key("Escape");
+        await page.evaluate("window.__awj.blur()");
+      });
+      const save = await page.awj<Point>("entrySave", first.selector);
+      if (!save.ok) {
+        trace(`${job.company}: the entry has no Save`);
+        return dump(page);
+      }
+      await inFront(page, () => page.click(save.x, save.y));
+      await sleep(BROWSER.pollMs * 4);
+      await settle(page);
+      d = await dump(page);
+      if (!d.fields.some((f) => f.selector === first.selector)) break;
+    }
+    // An entry the form refused stays open with its fields: the page's own fill then sees them like any other.
+    if (d.fields.some((f) => f.selector === first.selector)) {
+      trace(`${job.company}: the entry did not save: ${(await page.evaluate<string[]>("window.__awj.errors()")).join(" | ").slice(0, 300)}`);
+      return d;
+    }
+  }
+  return d;
+}
+
 /** Fills the page the tab shows, from its dump, and reports what the page holds afterwards. */
 async function fillPage(page: Page, jev: JevClient, profile: Profile, job: Job, d: FieldsDump, at: { page: number; earlier: FieldReport[]; started: number; jevCostUsd?: number }): Promise<FillReport> {
+  d = await addEntries(page, jev, profile, job, d);
   await readDropdownOptions(page, d.fields);
   trace(`${job.company}: options read ${Date.now() - at.started}ms`);
   const plan = await mapForm(jev, profile, job, d);
@@ -110,6 +277,13 @@ async function fillPage(page: Page, jev: JevClient, profile: Profile, job: Job, 
   const uploaded = new Set<string>();
   const uploadFailures: Failure[] = [];
   for (const u of plan.uploads) {
+    // A box that already took the resume to bring up the form keeps it: a second file would be read again and
+    // written over the form, wiping the answers put in after it.
+    if (await page.call<boolean>("function (s) { return document.documentElement.getAttribute('data-awj-resume-given') === s; }", u.selector)) {
+      uploaded.add(u.selector);
+      trace(`${job.company}: resume already given to bring up the form, not uploaded again`);
+      continue;
+    }
     const why = (await uploadFile(page, u.selector, u.path)) ?? null;
     if (!why) uploaded.add(u.selector);
     else uploadFailures.push({ selector: u.selector, why });
@@ -130,6 +304,19 @@ async function fillPage(page: Page, jev: JevClient, profile: Profile, job: Job, 
     const still = await applyFills(page, wiped, profile, guide);
     failedRaw = [...failedRaw.filter((x) => !wiped.some((f) => f.selector === x.selector)), ...still];
     trace(`${job.company}: put back ${wiped.length - still.length} of ${wiped.length} wiped value(s) after ${wait}ms`);
+  }
+  // A start written in words that the box threw away means a date box with no format named: it gets the day the
+  // words name as yyyy-mm-dd, which date boxes read one way only. A box left holding words it refuses stops the form
+  // (Cornerstone: "Please enter a valid date" blocked Next on an optional field).
+  for (const p of plan.fields.filter((x) => x.key === "earliest_start_date" && x.action === "fill" && TYPED_KINDS.has(x.kind) && !!x.value && !toYmd(x.value) && failedRaw.some((f) => f.selector === x.selector))) {
+    const day = startDayOf(p.value!, new Date());
+    if (!day) continue;
+    const still = await applyFills(page, [{ selector: p.selector, kind: p.kind, value: day }], profile, guide);
+    trace(`${job.company}: start date in words refused, typed ${day}: ${still.length ? still[0]!.why : "kept"}`);
+    if (still.length) continue;
+    failedRaw = failedRaw.filter((f) => f.selector !== p.selector);
+    p.value = day;
+    for (const f of plan.fills) if (f.selector === p.selector) f.value = day;
   }
   failedRaw = [...(await secondLook(page, jev, profile, job, d, plan, failedRaw)), ...uploadFailures];
   failedRaw = await followUp(page, jev, profile, job, d, plan, failedRaw);
@@ -164,8 +351,23 @@ async function followUp(page: Page, jev: JevClient, profile: Profile, job: Job, 
     await readDropdownOptions(page, added);
     const more = await mapForm(jev, profile, job, { ...now, fields: added });
     out = [...out, ...(await applyFills(page, more.fills, profile, guideFor({ ...now, fields: added })))];
-    d.fields.push(...added);
-    plan.fields.push(...more.fields);
+    // A file box that appears once the resume is in (an upload widget redrawn around the file) is the same box: the
+    // resume is not given twice. Any other new file box is given its file like the first ones.
+    // Such a box is left out of the plan altogether: it is the first box, already read back with its file.
+    const same = new Set<string>();
+    for (const f of more.fields.filter((p) => p.action === "upload" && p.value)) {
+      const given = await Promise.all(plan.uploads.map((u) => page.awj<boolean>("showsFile", path.basename(u.path))));
+      if (f.key === "resume_upload" && given.some(Boolean)) {
+        same.add(f.selector);
+        trace(`${job.company}: a resume box came up after the upload; the page already holds the resume`);
+        continue;
+      }
+      const why = await uploadFile(page, f.selector, f.value as string);
+      if (why) out.push({ selector: f.selector, why });
+      else plan.uploads.push({ selector: f.selector, path: f.value as string });
+    }
+    d.fields.push(...added.filter((f) => !same.has(f.selector)));
+    plan.fields.push(...more.fields.filter((f) => !same.has(f.selector)));
     plan.fills.push(...more.fills);
     plan.drafts.push(...more.drafts);
     plan.reviews.push(...more.reviews);
@@ -286,9 +488,9 @@ async function secondLook(page: Page, jev: JevClient, profile: Profile, job: Job
     if (!hasChoosableOptions(f) && failed.some((x) => x.selector === f.selector)) {
       const wanted = planned?.value ?? "";
       const pool = f.kind === "select" ? f.options : (await candidateOptions(page, f.selector, wanted)).map((o) => ({ value: o, label: o }));
-      const keep = new Set(closestOptions(pool.map((o) => o.label), wanted, FORM.maxOptionsForJev));
+      const keep = new Set(pool.length <= FORM.maxOptionsSecondLook ? pool.map((o) => o.label) : closestOptions(pool.map((o) => o.label), wanted, FORM.maxOptionsForJev));
       const options = pool.filter((o) => keep.has(o.label));
-      if (options.length) again.push({ ...f, options });
+      if (options.length) again.push({ ...f, options, wholeList: true });
     } else if (f.kind === "combobox" && hasChoosableOptions(f) && planned && planned.action !== "fill" && /no option fits|left unselected/.test(planned.note ?? "")) {
       again.push({ ...f, options: [] });
     }
@@ -317,17 +519,21 @@ async function secondLook(page: Page, jev: JevClient, profile: Profile, job: Job
 /** Reads the page back against the plan: what each field shows, what did not land, what is still empty. */
 async function readBack(page: Page, d: FieldsDump, plan: FillPlan, failedRaw: Failure[], uploaded = new Set<string>()): Promise<Pick<FillReport, "url" | "state" | "reason" | "fields" | "drafts" | "reviews" | "failed" | "leftBlank" | "missingRequired">> {
   const shown = await shownValues(page, plan.fields.map((f) => f.selector));
-  const fields = plan.fields.map((f, i) => ({ label: f.label, required: f.required, action: f.action, shown: uploaded.has(f.selector) ? path.basename(f.value ?? "") : shown[i] ?? "", note: f.note }));
+  // A board can redraw its upload control once the file is in (HiBob), so the file's name on the page counts too.
+  const onPage = await Promise.all(plan.fields.map((f) => (f.action === "upload" && f.value ? page.awj<boolean>("showsFile", path.basename(f.value)) : Promise.resolve(false))));
+  const fields = plan.fields.map((f, i) => ({ label: f.label, required: f.required, action: f.action, shown: uploaded.has(f.selector) || onPage[i] ? path.basename(f.value ?? "") : shown[i] ?? "", note: f.note }));
   const labelOf = (selector: string) => plan.fields.find((f) => f.selector === selector)?.label ?? selector;
   // The last line of defence: a value the plan wanted that the page does not show is a failure, whatever happened on the way.
   const states = await controlStates(page, plan.fields.map((f) => f.selector));
   const failed = [...failedRaw];
+  // An address panel writes the place in its own words ("70121 Bari BA, Italia"); any address it shows is its answer.
+  const isPanelField = (selector: string) => d.fields.some((x) => x.selector === selector && x.widget === "panel");
   plan.fields.forEach((f, i) => {
     if (states[i] === "off" || failed.some((x) => x.selector === f.selector)) return;
     const shownNow = fields[i]?.shown ?? "";
     if ((f.action === "fill" || f.action === "upload") && !shownNow) {
       failed.push({ selector: f.selector, why: states[i] === "missing" ? "the control is no longer on the page" : "the value is not confirmed on the page" });
-    } else if (f.action === "fill" && f.value && (TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !showsValue(f.value, shownNow)) {
+    } else if (f.action === "fill" && f.value && (TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !isPanelField(f.selector) && !showsValue(f.value, shownNow)) {
       failed.push({ selector: f.selector, why: `the box shows "${shownNow.slice(0, 40)}" instead of "${f.value.slice(0, 40)}"` });
     }
   });

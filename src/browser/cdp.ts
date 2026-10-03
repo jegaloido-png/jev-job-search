@@ -139,6 +139,9 @@ export class Page {
       else p.resolve(m.result);
     };
     await page.send("Page.enable");
+    // A click that lands on an upload button must never open the computer's file picker. Files reach a
+    // form only through setFiles, and only the ones the plan names (the resume, the cover letter).
+    await page.send("Page.setInterceptFileChooserDialog", { enabled: true });
     await page.send("Runtime.enable");
     await page.send("DOM.enable");
     await page.send("Network.enable");
@@ -249,12 +252,22 @@ export class Page {
   async click(x: number, y: number): Promise<void> {
     const at = { x, y, button: "left", clickCount: 1 };
     await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await this.send("Input.dispatchMouseEvent", { type: "mousePressed", ...at });
-    await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...at });
+    await sleep(BROWSER.clickHoverMs);
+    await this.send("Input.dispatchMouseEvent", { type: "mousePressed", ...at, buttons: 1 });
+    await sleep(BROWSER.clickHoldMs);
+    await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0 });
   }
 
   async type(text: string): Promise<void> {
     await this.send("Input.insertText", { text });
+  }
+
+  /** Types key by key, with a key-up after each, for a search box that only searches on key events. */
+  async typeKeys(text: string): Promise<void> {
+    for (const ch of text) {
+      await this.send("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch });
+      await this.send("Input.dispatchKeyEvent", { type: "keyUp", key: ch });
+    }
   }
 
   async key(key: "Escape" | "Enter" | "Backspace" | "Tab"): Promise<void> {
@@ -270,7 +283,7 @@ export class Page {
     // own document can lag behind after the tab has moved from a careers page to the board's form.
     const root = await this.send<{ result: { objectId: string } }>("Runtime.evaluate", { expression: "globalThis" });
     const found = await this.send<{ result: { objectId?: string; subtype?: string } }>("Runtime.callFunctionOn", {
-      functionDeclaration: "function (s) { return document.querySelector(s); }",
+      functionDeclaration: "function (s) { return window.__awj && window.__awj.q ? window.__awj.q(s) : document.querySelector(s); }",
       objectId: root.result.objectId,
       arguments: [{ value: selector }],
       returnByValue: false,

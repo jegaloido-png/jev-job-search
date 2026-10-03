@@ -10,9 +10,9 @@ import type { Profile } from "../profile/schema.js";
 import { sleep, type Page } from "./cdp.js";
 import { pickDate } from "./calendar.js";
 import { showsValue } from "../util/dates.js";
-import { fillDropdown, fillDropdownByClicking } from "./dropdowns.js";
+import { fillDropdown, fillDropdownByClicking, fillPanel } from "./dropdowns.js";
 import type { Failure, Fill } from "./report.js";
-import { controlStates, inFront, script, shownValues, trace, type Point } from "./session.js";
+import { controlStates, inFront, norm, script, shownValues, trace, type Point } from "./session.js";
 
 /** Applies fills to the open form. Returns the ones that did not land. */
 /** What the tool already knows about a site's controls, and where it reports what it finds out. */
@@ -26,6 +26,7 @@ export type FillGuide = {
 export async function applyFills(page: Page, fills: Fill[], profile: Profile, guide?: FillGuide): Promise<Failure[]> {
   const failed: Failure[] = [];
   const how = new Map<string, Method>();
+  const panels = new Set<string>();
   const hints = [profile.address.city, profile.address.region, profile.address.regionCode, profile.address.country];
   // fillFields.js is a function expression under a comment header; the protocol wants the bare expression.
   const fillScript = script("fillFields.js").replace(/^(\s*\/\/.*\n)+/, "").trim().replace(/;$/, "");
@@ -36,7 +37,8 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
   };
   const plain = fills.filter((f) => f.kind !== "combobox" && f.kind !== "calendar");
   // A control known to ignore a value set from script is typed into straight away: no failed first try, no waiting.
-  const typeFirst = plain.filter((f) => TYPED_KINDS.has(f.kind) && guide?.prefer(f.selector) === "typed");
+  // A date goes in key by key too: date pickers keep only what they saw typed, whatever the box shows.
+  const typeFirst = plain.filter((f) => TYPED_KINDS.has(f.kind) && (guide?.prefer(f.selector) === "typed" || DATE_TYPED.test(f.value)));
   const simple = plain.filter((f) => !typeFirst.includes(f));
   page.takeWrites();
   const [first, ...rest] = simple;
@@ -64,6 +66,22 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
   }
   for (const f of fills.filter((x) => x.kind === "combobox")) {
     const t = Date.now();
+    if (await page.awj<boolean>("isPanel", f.selector)) {
+      // A panel already showing an address is left alone: opening it again would only undo it.
+      // The site writes the address in its own words ("70121 Bari BA, Italia"), never the plan's.
+      panels.add(f.selector);
+      // Only an address that names the candidate's postal code or city counts; a country alone (read from a resume) does not.
+      const now = norm(await page.awj<string>("shown", f.selector));
+      if ([profile.address.postalCode, profile.address.city].some((x) => x && now.includes(norm(x)))) continue;
+      // An address panel is searched by the candidate's own postal code, then city, whatever the plan wrote.
+      const why = await fillPanel(page, f.selector, [profile.address.postalCode ?? "", profile.address.city], hints);
+      if (why) failed.push({ selector: f.selector, why });
+      else how.set(f.selector, "clicked");
+      panels.add(f.selector);
+      await page.writesSettled(BROWSER.saveMs);
+      trace(`panel ${f.selector} ${Date.now() - t}ms${why ? ` failed: ${why}` : ""}`);
+      continue;
+    }
     const { why, method } = await fillDropdown(page, f.selector, f.value, hints, guide?.prefer(f.selector) === "clicked");
     if (why) failed.push({ selector: f.selector, why });
     else how.set(f.selector, method);
@@ -111,7 +129,7 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
       continue;
     }
     // A typed box must show the value it was given, in whatever shape the site writes it. Anything else is a retry.
-    const landed = !!shown[i] && (!(TYPED_KINDS.has(f.kind) || f.kind === "combobox") || showsValue(f.value, shown[i] ?? ""));
+    const landed = !!shown[i] && (panels.has(f.selector) ? true : !(TYPED_KINDS.has(f.kind) || f.kind === "combobox") || showsValue(f.value, shown[i] ?? ""));
     if (landed) guide?.landed(f.selector, how.get(f.selector) ?? "script");
     if (landed || failed.some((x) => x.selector === f.selector)) continue;
     if (f.kind === "checkbox" && !/^(true|yes|1|on|checked)$/i.test(f.value)) continue;
@@ -125,6 +143,9 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
 }
 
 export const TYPED_KINDS = new Set(["text", "email", "tel", "url", "number", "textarea"]);
+
+/** A date written out in digits ("25-06-2004", "06/25/2004", "2004-06-25"), a month and year ("01/2022"), or a year alone ("2023"), which year pickers take the same way. */
+const DATE_TYPED = /^(\d{1,4}[\/.-]\d{1,2}[\/.-]\d{1,4}|\d{1,2}[\/.-]\d{4}|(19|20)\d{2})$/;
 
 /** Types into a field with real key input, for the rare control that ignores a value set from script. */
 function typeInto(page: Page, selector: string, value: string): Promise<string | null> {
@@ -143,9 +164,16 @@ function typeInto(page: Page, selector: string, value: string): Promise<string |
         if (!(await page.awj<boolean>("hasFocus", selector))) break;
       }
       await page.evaluate("window.__awj.selectAll()");
-      await page.type(value);
+      if (DATE_TYPED.test(value)) {
+        await page.key("Backspace");
+        await page.typeKeys(value);
+      } else await page.type(value);
       // Leave the box the way a person does. Some phone boxes throw away what was typed when focus is taken from them by script.
-      await page.key("Tab");
+      // A date box is left with Escape instead: its calendar closes, and Tab would land on the next control and open it.
+      if (DATE_TYPED.test(value)) {
+        await page.key("Escape");
+        await page.evaluate("window.__awj.blur()");
+      } else await page.key("Tab");
       await sleep(BROWSER.pollMs);
       if (await page.awj<string>("shown", selector)) break;
     }
@@ -167,6 +195,7 @@ function clickGroupOption(page: Page, selector: string, value: string): Promise<
 
 /** Attaches a file and waits until the form's server has it. A refused upload (a rate limit) gets one unhurried second try. Returns why it failed, or undefined. */
 export async function uploadFile(page: Page, selector: string, file: string): Promise<string | undefined> {
+  if (await page.awj<boolean>("isFileProxy", selector)) return uploadThroughButton(page, selector, file);
   let why: string | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt) await sleep(BROWSER.retryAfterMs * 2);
@@ -181,10 +210,43 @@ export async function uploadFile(page: Page, selector: string, file: string): Pr
     await sleep(BROWSER.pollMs * 2);
     const settled = await page.writesSettled(BROWSER.uploadMs);
     const refused = page.takeWrites().failed;
+    // Some boards (HiBob) show the chosen file in a dialog that keeps it only once its own "Done" is pressed.
+    const done = await page.awj<Point>("dialogButton", DIALOG_DONE);
+    if (done.ok) {
+      await page.click(done.x, done.y);
+      await sleep(BROWSER.pollMs * 3);
+    }
     if (settled && !refused.length) return undefined;
     why = settled ? `the upload was refused: ${refused[0]}` : "the upload did not finish";
   }
   return why;
+}
+
+/** The button that closes an upload dialog once it holds the file. */
+const DIALOG_DONE = "^\\s*(done|ok|save|confirm|fatto|salva|conferma|fertig|speichern|ok, fertig|terminé|enregistrer|listo|guardar)\\s*$";
+
+/**
+ * A form whose "Add file" button opens a dialog of its own (HiBob): the button is pressed, the file goes into
+ * the box the dialog shows, and the dialog is closed with its own button. The form then shows the file.
+ */
+async function uploadThroughButton(page: Page, selector: string, file: string): Promise<string | undefined> {
+  const name = path.basename(file);
+  if (!(await page.awj<boolean>("openFileButton", selector))) return "the upload button was not found";
+  const deadline = Date.now() + BROWSER.optionsMs * 2;
+  while (!(await page.awj<boolean>("pickFileBox"))) {
+    if (Date.now() > deadline) return "the upload button brought up no file box";
+    await sleep(BROWSER.pollMs);
+  }
+  if (!(await page.setFiles('[data-awj-picked="1"]', [file]))) return "file input not found";
+  if (!(await waitForFile(page, name))) return "the page did not show the uploaded file";
+  await sleep(BROWSER.pollMs * 2);
+  await page.writesSettled(BROWSER.uploadMs);
+  const done = await page.awj<Point>("dialogButton", DIALOG_DONE);
+  if (done.ok) {
+    await page.click(done.x, done.y);
+    await sleep(BROWSER.pollMs * 3);
+  }
+  return (await page.awj<boolean>("showsFile", name)) ? undefined : "the form did not keep the uploaded file";
 }
 
 async function waitForFile(page: Page, name: string): Promise<boolean> {

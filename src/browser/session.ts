@@ -45,7 +45,10 @@ export async function settle(page: Page): Promise<void> {
     let n = -1;
     try {
       // "interactive" is enough: a tracker or a font that never finishes loading must not hold the form up.
-      n = await page.evaluate<number>("document.readyState !== 'loading' ? document.querySelectorAll('input, select, textarea').length : -1");
+      // Controls inside shadow roots count too: a form drawn with web components shows none in the page itself.
+      n = await page.evaluate<number>(
+        "(() => { if (document.readyState === 'loading') return -1; let n = 0; const walk = (r) => { n += r.querySelectorAll('input, select, textarea').length; for (const e of r.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot); }; walk(document); return n; })()",
+      );
     } catch {
       n = -1; // mid-navigation
     }

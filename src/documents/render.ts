@@ -16,15 +16,20 @@ import { activeTemplate } from "./templates.js";
 export const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c);
 
 /** "2026-05" or "2026-05-01" as "May 2026"; anything else as it is. */
+/** The words the documents print around dates, in the language set in DOCUMENTS.locale. */
+const WORDS = {
+  en: { months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], to: "to", present: "present", expected: "expected ", dateLocale: "en-US" },
+  it: { months: ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"], to: "-", present: "oggi", expected: "previsto ", dateLocale: "it-IT" },
+}[DOCUMENTS.locale];
+
 export const prettyMonth = (s: string) => {
   const m = /^(\d{4})-(\d{2})/.exec(s.trim());
   if (!m) return s;
-  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  return `${names[Number(m[2]) - 1] ?? m[2]} ${m[1]}`;
+  return `${WORDS.months[Number(m[2]) - 1] ?? m[2]} ${m[1]}`;
 };
-const span = (start: string, end: string, current: boolean) => `${prettyMonth(start)} to ${current ? "present" : prettyMonth(end)}`;
+const span = (start: string, end: string, current: boolean) => `${prettyMonth(start)} ${WORDS.to} ${current ? WORDS.present : prettyMonth(end)}`;
 
-const monthYear = (month: number, year: number) => `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month - 1] ?? ""} ${year}`.trim();
+const monthYear = (month: number, year: number) => `${WORDS.months[month - 1] ?? ""} ${year}`.trim();
 
 /** Everything a resume template may print, already in words: dates as "May 2026", the contact line joined. */
 export function resumeView(profile: Profile, t: Tailored): View {
@@ -36,7 +41,7 @@ export function resumeView(profile: Profile, t: Tailored): View {
     const src = profile.projects.find((x) => x.name.toLowerCase().includes(p.name.toLowerCase()) || p.name.toLowerCase().includes(x.name.toLowerCase()));
     return { name: p.name, role: src?.role ?? "", link: src?.link ? src.link.replace(/^https?:\/\/(www\.)?/, "") : "", when: src ? span(src.start, src.end, /present|current|now/i.test(src.end) || !src.end) : "", bullets: p.bullets };
   });
-  const education = profile.education.map((e) => ({ degree: e.degree, field: e.field, minor: e.minor ?? "", school: e.school, when: `${e.startYear} to ${e.status === "in_progress" ? "expected " : ""}${monthYear(e.gradMonth, e.gradYear)}` }));
+  const education = profile.education.map((e) => ({ degree: e.degree, field: e.field, minor: e.minor ?? "", school: e.school, when: `${e.startYear} ${WORDS.to} ${e.status === "in_progress" ? WORDS.expected : ""}${monthYear(e.gradMonth, e.gradYear)}` }));
   return {
     name: `${profile.name.first} ${profile.name.last}`,
     headline: t.headline,
@@ -59,7 +64,7 @@ export function coverView(profile: Profile, entry: { job: { company: string; tit
   return {
     name,
     contact: contactText(profile),
-    date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+    date: new Date().toLocaleDateString(WORDS.dateLocale, { year: "numeric", month: "long", day: "numeric" }),
     company: entry.job.company,
     role: entry.job.title,
     greeting: letter.greeting,

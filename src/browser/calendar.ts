@@ -6,7 +6,7 @@
  */
 import { BROWSER } from "../config.js";
 import { sleep, type Page } from "./cdp.js";
-import { monthOfHeading, showsDate, toYmd } from "../util/dates.js";
+import { isoOf, monthOfHeading, showsDate, toYmd } from "../util/dates.js";
 import { inFront, type Point } from "./session.js";
 
 type Calendar = { open: boolean; heading: string; prev: Point; next: Point; days: { day: number; x: number; y: number }[] };
@@ -19,6 +19,13 @@ export function pickDate(page: Page, selector: string, value: string): Promise<s
   const want = toYmd(value);
   if (!want) return Promise.resolve(`"${value}" is not a date the calendar can be set to`);
   return inFront(page, async () => {
+    // A picker library that takes a date from script (flatpickr) is given it there: a birth date is hundreds of
+    // months away from the one a calendar opens on.
+    if (await page.awj<boolean>("pickerSet", selector, isoOf(want))) {
+      await sleep(BROWSER.pollMs * 2);
+      const shown = await page.awj<string>("shown", selector);
+      if (showsDate(shown, want)) return null;
+    }
     const read = () => page.awj<Calendar>("calendar", selector);
     let cal = await read();
     if (!cal.open) {

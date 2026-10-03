@@ -74,6 +74,9 @@ export function loadEnv(file = path.join(ROOT, ".env")): void {
 export const JEV = {
   endpoint: "https://openrouter.ai/api/alpha/decisions",
   model: "typesafe/jev-1.13",
+  /** TypeSafe's own endpoint, used when only TYPESAFE_API_KEY is set. */
+  typesafeEndpoint: "https://api.typesafe.ai/v1/systemone",
+  typesafeModel: "jev-latest",
   /** Context window per the model page. We keep requests well under it. */
   contextTokens: 32_000,
   /** Approximate budget for the job description inside a rating request (chars, ~4 chars per token). */
@@ -156,12 +159,18 @@ export const GRADUATION_MISMATCH_MULTIPLIER = 0.6;
 export const RECENCY_FLOOR = 0.7;
 
 export const FORM = {
+  /** Part of every cached plan's key: raised when the planning rules change, so old plans are not reused. */
+  planVersion: 15,
+  /** Most sections filled one entry at a time (Experience, Education) that are given an entry on one page. */
+  maxEntrySections: 4,
   /** JEV confidence at or above which a mapping is applied without note. */
   autoConfidence: 0.9,
   /** Below this, Claude decides the field by hand. */
   reviewConfidence: 0.5,
   /** Selects with more options than this are pre-filtered in code before JEV sees them. */
   maxOptionsForJev: 40,
+  /** On a second look at a dropdown that refused the value, a list up to this long is given whole: the closest few by spelling can miss the right one ("Amministrazione/Contabilità" for an accountant). */
+  maxOptionsSecondLook: 150,
   /** How many times a page is read again after a fill, for questions that only appear once another is answered. */
   followUpRounds: 3,
   /** The most optional fields that may be left blank because they could not be set. More than this means the fill itself went wrong, and the form is held. */
@@ -180,7 +189,12 @@ export const CACHE = {
 
 export const BROWSER = {
   /** The Chrome binary the fill runner drives over the DevTools protocol. */
-  chromePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  chromePath:
+    process.platform === "win32"
+      ? "C:/Program Files/Google/Chrome/Application/chrome.exe"
+      : process.platform === "linux"
+        ? "/usr/bin/google-chrome"
+        : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   /** Local DevTools port of the runner's own Chrome window. */
   port: 9333,
   /** Its profile lives with the other run data, so it is git-ignored and keeps cookies between runs. */
@@ -205,7 +219,15 @@ export const BROWSER = {
   submitMs: 12_000,
   /** A page that still looks like the form after that, with no error on it, is given this much longer: some boards take their time to confirm. */
   confirmMs: 20_000,
+  /** Longest wait for CODE_COMMAND to find a code the board emailed. */
+  codeWaitMs: 240_000,
   pollMs: 150,
+  /**
+   * A click is a person's click: the pointer rests on the target, then the button goes down and up. Some web
+   * components (SmartRecruiters' multiselect options) ignore a press with no hover before it and no button held.
+   */
+  clickHoverMs: 80,
+  clickHoldMs: 60,
 } as const;
 
 /**
@@ -259,8 +281,10 @@ export const DOCUMENTS = {
   resumePages: 1,
   /** Pages the cover letter may run to. */
   coverPages: 1,
-  /** Paper for the PDFs, in inches. US Letter; A4 is 8.27 by 11.69. */
-  paper: { width: 8.5, height: 11 },
+  /** The language the documents print dates in: "it" or "en". */
+  locale: "it" as "it" | "en",
+  /** Paper for the PDFs, in inches. A4 for Italy; US Letter is 8.5 by 11. */
+  paper: { width: 8.27, height: 11.69 },
   /** How long one headless Chrome print may take. */
   printTimeoutMs: 30_000,
   /** The stock templates shipped with the tool, and where a person's own go. */
@@ -269,7 +293,12 @@ export const DOCUMENTS = {
   /** Which template is in use, kept in data/. */
   activeTemplate: path.join(ROOT, "data", "template.json"),
   /** Words that may be capitalized in a sentence without being a claim about the candidate. */
-  plainWords: ["I", "A", "An", "The", "My", "In", "At", "On", "For", "With", "And", "As", "To", "Of", "This", "That", "It", "We", "You", "Your", "Our", "If", "When", "While", "After", "Before", "Over", "Since", "Through", "Then", "There", "Here", "What", "Which", "Who", "How", "Why", "Yes", "No", "Dear", "Hi", "Hello", "Sincerely", "Best", "Regards", "Thank", "Thanks", "Team", "Hiring", "Manager", "Regarding", "Re"],
+  plainWords: ["I", "A", "An", "The", "My", "In", "At", "On", "For", "With", "And", "As", "To", "Of", "This", "That", "It", "We", "You", "Your", "Our", "If", "When", "While", "After", "Before", "Over", "Since", "Through", "Then", "There", "Here", "What", "Which", "Who", "How", "Why", "Yes", "No", "Dear", "Hi", "Hello", "Sincerely", "Best", "Regards", "Thank", "Thanks", "Team", "Hiring", "Manager", "Regarding", "Re",
+    // Italian sentence openers and letter words, so an Italian letter is not read as naming things the profile lacks.
+    "Il", "Lo", "La", "Le", "Gli", "Un", "Uno", "Una", "Nel", "Nella", "Nei", "Negli", "Nelle", "Per", "Con", "Da", "Di", "Del", "Della", "Al", "Alla", "Ai", "Su", "Sul", "Sulla",
+    "E", "Ed", "Ma", "Se", "Come", "Quando", "Mentre", "Dopo", "Prima", "Durante", "Presso", "Oggi", "Attualmente", "Inoltre", "Grazie", "Questa", "Questo", "Queste", "Questi",
+    "Ho", "Sono", "Mi", "Vi", "Vorrei", "Desidero", "Credo", "Ritengo", "Ringrazio", "Resto", "Allego", "Gentile", "Gentili", "Spettabile", "Egregio", "Egregi", "Caro", "Cara",
+    "Cordiali", "Saluti", "Distinti", "Cordialmente", "Buongiorno", "Ufficio", "Risorse", "Umane", "Selezione", "Responsabile", "Personale"],
 } as const;
 
 /** The dashboard: a page on your own machine that reads the records and lets you change a status by hand. */
@@ -279,7 +308,17 @@ export const REPORT = {
   statuses: ["applied", "needs_review", "queued", "skipped", "blocked", "failed"],
 } as const;
 
-export type WriterBackend = "claude-code" | "api";
+export type WriterBackend = "claude-code" | "api" | "vertex";
+
+/** Gemini on Vertex AI, used with WRITER_BACKEND=vertex and VERTEX_API_KEY in .env. */
+export const VERTEX = {
+  model: "gemini-3.5-flash",
+  project: "gen-lang-client-0141398558",
+  location: "global",
+  maxOutputTokens: 16_384,
+  /** USD per million tokens, only to report what calls cost. Thinking tokens bill as output. */
+  pricesPerMillion: { input: 1.5, output: 9 },
+} as const;
 
 /**
  * How Claude is reached. Claude Code runs headless on the person's own subscription and is the
@@ -288,7 +327,7 @@ export type WriterBackend = "claude-code" | "api";
  */
 export function writerBackend(): WriterBackend {
   const asked = (process.env.WRITER_BACKEND ?? "").trim();
-  if (asked === "claude-code" || asked === "api") return asked;
+  if (asked === "claude-code" || asked === "api" || asked === "vertex") return asked;
   return process.env.ANTHROPIC_API_KEY ? "api" : "claude-code";
 }
 
@@ -336,7 +375,7 @@ export const RUN = {
   /** After this many applications the runner's cookies, cache and site data are cleared, between runs, so one long session does not read as a robot. */
   clearBrowsingEvery: 15,
   /** How many times a form is opened and filled when values did not land. The second go comes when the other forms are done, with the window to itself. */
-  fillAttempts: 2,
+  fillAttempts: 1, // was 2: a second go re-opened the whole form and repeated the same misses (owner, 2026-10-03)
   /** Longest one form may take to open and fill. A page that never settles is recorded as blocked instead of holding up the run. */
   fillTimeoutMs: 180_000,
   /** Forms handed to the writer at once. */

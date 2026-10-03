@@ -140,13 +140,17 @@ const buttons = (submitSelectors: string[]) => submitSelectors.map((s) => ({ sel
 /** The control that sends the form, from the buttons the dump found. English first, then the French a bilingual Canadian form uses. */
 export function pickSubmit(submitSelectors: string[]): { selector: string; text: string } | null {
   const candidates = buttons(submitSelectors);
-  return candidates.find((c) => /submit|soumettre/i.test(c.text)) ?? candidates.find((c) => /apply|send|finish|postuler|envoyer/i.test(c.text) && !/linkedin|indeed/i.test(c.text)) ?? null;
+  return (
+    candidates.find((c) => /submit|soumettre|invia|inviare|pošalji|posalji|absenden|einreichen|abschicken|übermitteln|enviar|verzenden|versturen/i.test(c.text) && !/linkedin|indeed/i.test(c.text)) ??
+    candidates.find((c) => /apply|applica|send|finish|postuler|envoyer|candidati|candidatura|candidarsi|bewerben|senden|conferma|termina|completa|solliciteer/i.test(c.text) && !/linkedin|indeed/i.test(c.text)) ??
+    null
+  );
 }
 
 /** The control that leads to the next page, when the page has one and has no way to send. */
 export function pickNext(submitSelectors: string[]): { selector: string; text: string } | null {
   if (pickSubmit(submitSelectors)) return null;
-  return buttons(submitSelectors).find((c) => /^(next|next step|continue|save and continue|save & continue|save and next)\b/i.test(c.text)) ?? null;
+  return buttons(submitSelectors).find((c) => /^(next|next step|continue|save and continue|save & continue|save and next|avanti|prosegui|procedi|continua|successivo|weiter|siguiente|continuar|volgende)\b/i.test(c.text)) ?? null;
 }
 
 export type Failure = { selector: string; why: string };

@@ -37,8 +37,8 @@ export const ProfileSchema = z.object({
     countryCode: z.string().length(2),
   }),
   links: z.object({
-    linkedin: z.string().url(),
-    github: z.string().url(),
+    linkedin: z.string().url().optional(),
+    github: z.string().url().optional(),
     website: z.string().url().optional(),
     portfolio: z.string().url().optional(),
   }),

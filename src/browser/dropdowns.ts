@@ -48,6 +48,18 @@ export function pickOption(options: string[], value: string, hints: string[]): s
   const includes = options.filter((o) => norm(o).includes(want));
   const pool = exact.length ? exact : starts.length ? starts : includes;
   if (pool.length) return best(pool);
+  // A street address comes back in the list's own order ("Via Roma 1, Bari" as "Via Roma, 1, 70131 Bari, Italy"):
+  // the same street, the same house number, and one part that is the candidate's city once its postal code is taken off.
+  const street = /^(\D+?)[\s,]+(\d+[a-z]?)$/i.exec((value.split(",")[0] ?? "").trim());
+  const city = norm(value.split(",")[1] ?? "");
+  if (street && city) {
+    const [name, num] = [norm(street[1] as string), (street[2] as string).toLowerCase()];
+    const same = options.filter((o) => {
+      const n = norm(o);
+      return n.includes(name) && new RegExp(`(^|[^0-9a-z])${num}([^0-9a-z]|$)`).test(n) && o.split(",").some((part) => norm(part.replace(/\d+/g, "")) === city);
+    });
+    if (same.length) return best(same);
+  }
   const head = norm(value.split(",")[0] ?? "");
   if (!head || head === want) return null;
   // The city alone proves nothing (there is an Edmonton in Kentucky): a region or country of the candidate's must be named too.
@@ -89,6 +101,8 @@ export async function readOptions(page: Page, selector: string): Promise<string[
   }
   return inFront(page, async () => {
     if (!(await openDropdown(page, selector))) return [];
+    // A search typed into the menu on an earlier try would hide most of the list.
+    if (await page.awj<boolean>("clearListSearch", selector)) await sleep(BROWSER.pollMs * 2);
     const seen = await waitOptions(page, selector, false);
     await closeDropdown(page);
     return seen;
@@ -99,7 +113,7 @@ export async function readOptions(page: Page, selector: string): Promise<string[
 export async function readDropdownOptions(page: Page, fields: DumpedField[]): Promise<void> {
   await Promise.all(
     fields
-      .filter((f) => f.kind === "combobox" && f.options.length === 0)
+      .filter((f) => f.kind === "combobox" && f.options.length === 0 && f.widget !== "panel")
       .map(async (f) => {
         const opts = await readOptions(page, f.selector);
         if (opts.length > 0 && opts.length <= FORM.maxOptionsForJev) f.options = opts.map((o) => ({ value: o, label: o }));
@@ -212,6 +226,100 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   const shown = (await shownValues(page, [selector]))[0] ?? "";
   if (shown && !showsValue(choice, shown)) return `the list shows "${shown.slice(0, 40)}" after "${choice}" was clicked`;
   return null;
+}
+
+/**
+ * A combobox that opens a panel of fields of its own (inRecruiting's address: country, then "postal code or city",
+ * from which the site fills in the rest). The panel is opened, the candidate's postal code is typed into its search
+ * box, then the city, and the suggestion that names the candidate's places is clicked. Returns why it failed, or null.
+ */
+export function fillPanel(page: Page, selector: string, searches: string[], hints: string[]): Promise<string | null> {
+  return inFront(page, async () => {
+    const why = await panelOnce(page, selector, searches, hints);
+    // A panel left open covers the fields below it, so a failed one is closed before anything else is filled.
+    if (why && (await page.awj<unknown[]>("panelBoxes", selector)).length) {
+      await page.key("Escape");
+      if ((await page.awj<unknown[]>("panelBoxes", selector)).length) {
+        const p = await page.awj<Point>("point", selector);
+        if (p.ok) await page.click(p.x, p.y);
+      }
+    }
+    return why;
+  });
+}
+
+async function panelOnce(page: Page, selector: string, searches: string[], hints: string[]): Promise<string | null> {
+  {
+    const p = await page.awj<Point>("point", selector);
+    if (!p.ok) return "control not found";
+    await page.click(p.x, p.y);
+    let boxes: { selector: string; label: string; value: string }[] = [];
+    const deadline = Date.now() + BROWSER.optionsMs;
+    let clickedAgain = false;
+    while (!boxes.length && Date.now() < deadline) {
+      await sleep(BROWSER.pollMs);
+      boxes = await page.awj("panelBoxes", selector);
+      // The first click may only have closed another popup (a calendar left open); a second one opens the panel.
+      if (!boxes.length && !clickedAgain && Date.now() > deadline - BROWSER.optionsMs / 2) {
+        clickedAgain = true;
+        await page.key("Escape");
+        const again = await page.awj<Point>("point", selector);
+        if (again.ok) await page.click(again.x, again.y);
+      }
+    }
+    // A panel that starts with an empty country keeps its other boxes switched off until one is picked.
+    const country = await page.awj<{ selector: string; label: string; value: string } | null>("panelCountry", selector);
+    if (country && !country.value && country.label) {
+      const name = hints[hints.length - 1] ?? "";
+      if (name && (await page.awj<boolean>("focus", country.selector))) {
+        // The first letters find the country in any language the list is written in: "Ital" is Italia, Italy, Italien.
+        const typed = name.slice(0, 4);
+        await page.typeKeys(typed);
+        let row: (Point & { label: string }) | undefined;
+        const until = Date.now() + BROWSER.optionsMs;
+        while (!row && Date.now() < until) {
+          await sleep(BROWSER.pollMs * 2);
+          row = (await page.awj<(Point & { label: string })[]>("suggestions", typed)).find((r) => r.ok && norm(r.label).startsWith(norm(typed)));
+        }
+        if (row) {
+          await page.click(row.x, row.y);
+          await sleep(BROWSER.pollMs * 3);
+        }
+      }
+      boxes = await page.awj("panelBoxes", selector);
+    }
+    if (!boxes.length) return "the panel opened no box to type in";
+    // The search box: the one asking for a postal code or a city, else the first empty one.
+    // The search box is emptied before typing, so one that still shows a placeholder or an old search is fine.
+    const SEARCH = /\b(cap|postal|zip|plz|code postal|citt[aà]|city|comune|town)\b/i;
+    // The panel draws its boxes one after another; the search box can come a moment after the country.
+    for (const until = Date.now() + BROWSER.optionsMs; !boxes.some((b) => SEARCH.test(b.label)) && Date.now() < until; ) {
+      await sleep(BROWSER.pollMs * 2);
+      boxes = await page.awj("panelBoxes", selector);
+    }
+    const box = boxes.find((b) => SEARCH.test(b.label)) ?? boxes.find((b) => !b.value);
+    if (!box) return `the panel has no search box among: ${boxes.map((b) => `${b.label || "?"}=${b.value}`).join(", ")}`;
+    for (const typed of searches.filter(Boolean)) {
+      if (!(await page.awj<boolean>("focus", box.selector))) return "could not focus the panel's search box";
+      await page.evaluate("window.__awj.selectAll()");
+      await page.key("Backspace");
+      await page.typeKeys(typed);
+      let rows: (Point & { label: string })[] = [];
+      let choice: string | null = null;
+      const until = Date.now() + BROWSER.optionsMs;
+      while (!choice && Date.now() < until) {
+        await sleep(BROWSER.pollMs * 2);
+        rows = await page.awj("suggestions", typed);
+        choice = pickOption(rows.map((r) => r.label), typed, hints);
+      }
+      const row = choice ? (await page.awj<(Point & { label: string })[]>("suggestions", typed)).find((r) => r.label === choice) : undefined;
+      if (!row?.ok) continue;
+      await page.click(row.x, row.y);
+      await sleep(BROWSER.pollMs * 3);
+      if (await page.awj<string>("shown", selector)) return null;
+    }
+    return `no suggestion matched ${searches.filter(Boolean).join(" or ")}`;
+  }
 }
 
 /** The options most like the wanted value, by shared word stems, so a list of hundreds fits in one JEV question. */

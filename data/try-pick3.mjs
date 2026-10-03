@@ -1,0 +1,27 @@
+// Diagnoses a web-component multiselect in an open tab (port 9333): opens it, then tries a slow real click on the option, then a script click on the option host, and reports the selection after each.
+import fs from "node:fs";
+const [want, sel, optRe] = process.argv.slice(2);
+const tabs = await fetch("http://127.0.0.1:9333/json/list").then((r) => r.json());
+const t = tabs.find((x) => x.type === "page" && x.url.includes(want));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+await new Promise((r) => (ws.onopen = r));
+let id = 0;
+const send = (method, params = {}) => new Promise((res) => { const my = ++id; ws.addEventListener("message", function h(ev) { const m = JSON.parse(ev.data); if (m.id === my) { ws.removeEventListener("message", h); res(m.result); } }); ws.send(JSON.stringify({ id: my, method, params })); });
+const ev = async (expression) => { const r = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }); return r.exceptionDetails ? "EXC " + JSON.stringify(r.exceptionDetails).slice(0, 600) : r.result.value; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await ev(fs.readFileSync("src/forms/pageHelpers.js", "utf8"));
+const S = JSON.stringify(sel);
+const state = () => ev(`(() => { const e = window.__awj.q(${S}); const r = e.getRootNode(); const opts = [...r.querySelectorAll('spl-select-option')].map(o => (o.getAttribute('aria-selected')||o.selected||'') + ':' + (o.textContent||'').trim().slice(0,20)); const h = r.host; return 'hostValue=' + JSON.stringify(h.value) + ' opts=' + opts.join(' | ') + ' expanded=' + e.getAttribute('aria-expanded'); })()`);
+const open = async () => { const p = await ev(`window.__awj.point(${S})`); for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) await send("Input.dispatchMouseEvent", { type, x: p.x, y: p.y, button: "left", clickCount: 1 }); await sleep(800); };
+await open();
+const label = (await ev(`window.__awj.options(${S})`)).find((o) => new RegExp(optRe, "i").test(o));
+let p = await ev(`window.__awj.optionPoint(${S}, ${JSON.stringify(label)})`);
+await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }); await sleep(250);
+await send("Input.dispatchMouseEvent", { type: "mousePressed", x: p.x, y: p.y, button: "left", buttons: 1, clickCount: 1 }); await sleep(120);
+await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: p.x, y: p.y, button: "left", buttons: 0, clickCount: 1 }); await sleep(800);
+console.log("after slow click:", await state());
+await open();
+console.log("script click:", await ev(`(() => { const e = window.__awj.q(${S}); const o = [...e.getRootNode().querySelectorAll('spl-select-option')].find(x => /${optRe}/i.test(x.textContent)); o.click(); return !!o; })()`));
+await sleep(800);
+console.log("after script click:", await state());
+process.exit(0);

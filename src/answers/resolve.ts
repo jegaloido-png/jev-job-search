@@ -5,9 +5,11 @@
  * JSON object. It may also say the job should not be applied to, with a reason.
  */
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { z } from "zod";
-import { DOCUMENTS, PATHS, WRITER, writerBackend } from "../config.js";
+import { documentsFor } from "../documents/tailor.js";
+import { DOCUMENTS, PATHS, VERTEX, WRITER, writerBackend } from "../config.js";
 import type { QueueEntry } from "../jobs/queue.js";
 import type { Profile } from "../profile/schema.js";
 import { BANK_DRAFTS, BANK_INTENTS } from "./bank.js";
@@ -22,6 +24,7 @@ const SYSTEM = [
   "",
   "Truth comes first.",
   "- Use only the candidate's facts, experience, projects, standing answers and the job posting. Never invent a fact, a number, a skill level, a date or a credential.",
+  "- When the form comes with resume_for_this_job, that is the resume attached to this application, written from the same facts for this posting. Keep every answer and the cover letter consistent with it, and lead with what it puts first.",
   "- Work authorization, citizenship, education and dates are exactly as given. The candidate is authorized only in the countries listed and needs sponsorship elsewhere.",
   "- If a required field cannot be answered truthfully from the facts (a residence the candidate does not have, a self-rating of a skill the facts do not mention, a quiz or take-home, a clearance, a reference's contact details), do not guess: set verdict to \"needs_review\" and say which field in reason.",
   "- needs_review is only for that. When the facts or a standing answer reasonably settle a field, answer it and keep the verdict \"ready\". A person who is not employed has no notice period, so the shortest option is true.",
@@ -58,8 +61,9 @@ export function candidateContext(profile: Profile): Record<string, unknown> {
       ...ctx.candidate,
       email: profile.email,
       phone: `${profile.phone.countryCode} ${profile.phone.national}`,
+      date_of_birth: profile.dateOfBirth,
       education: profile.education,
-      address: `${profile.address.city}, ${profile.address.region}, ${profile.address.country}`,
+      address: [profile.address.line1, profile.address.postalCode, profile.address.city, profile.address.region, profile.address.country].filter(Boolean).join(", "),
       spokenLanguages: profile.spokenLanguages,
       demographics: profile.demographics,
       preferences: profile.preferences,
@@ -83,7 +87,17 @@ export const contextFingerprint = (profile: Profile) => fingerprintOf(buildSyste
 
 /** The part that changes per form: the job, what is already filled, and the open fields. */
 export function buildPrompt(entry: QueueEntry | null, filled: { label: string; value: string }[], open: OpenField[]): string {
-  return JSON.stringify({ job: jobContext(entry), already_filled: filled, open_fields: open }, null, 1);
+  // Today's date rides with each form, not the system prompt, so remembered answers stay tied to the same candidate.
+  // Without it a start date came out in the past ("2025-03-17").
+  const today = `${new Date().toISOString().slice(0, 10)} (a start date, or any date still to come, is on or after this day)`;
+  return JSON.stringify({ today, job: jobContext(entry), resume_for_this_job: resumeForJob(entry), already_filled: filled, open_fields: open }, null, 1);
+}
+
+/** The text of the resume written for this job, when one was: the writer answers in step with what the company receives. */
+function resumeForJob(entry: QueueEntry | null): string | undefined {
+  const dir = entry ? documentsFor(entry.job.id)?.dir : undefined;
+  const md = dir ? path.join(dir, "resume.md") : null;
+  return md && existsSync(md) ? readFileSync(md, "utf8").slice(0, 6_000) : undefined;
 }
 
 /** Pulls the JSON object out of the writer's reply, whether or not it wrapped it in a code fence. */
@@ -137,7 +151,7 @@ function recordWriterCall(envelope: Envelope, meta: { purpose: WriterCall["purpo
   const call: WriterCall = {
     at: new Date().toISOString(),
     ...meta,
-    model: WRITER.model,
+    model: writerBackend() === "vertex" ? process.env.VERTEX_MODEL || VERTEX.model : WRITER.model,
     inputTokens: u.input_tokens ?? 0,
     cacheWriteTokens: u.cache_creation_input_tokens ?? 0,
     cacheReadTokens: u.cache_read_input_tokens ?? 0,
@@ -217,8 +231,43 @@ async function callApi(prompt: string, system: string, meta: { purpose: WriterCa
   return text;
 }
 
+/** Gemini on Vertex AI, billed to VERTEX_API_KEY. VERTEX_MODEL, VERTEX_PROJECT_ID and VERTEX_LOCATION override the defaults. */
+async function callVertex(prompt: string, system: string, meta: { purpose: WriterCall["purpose"]; jobId: string }): Promise<string> {
+  const key = process.env.VERTEX_API_KEY;
+  if (!key) throw new Error("VERTEX_API_KEY is not set. Add it to .env, or remove WRITER_BACKEND=vertex.");
+  const model = process.env.VERTEX_MODEL || VERTEX.model;
+  const project = process.env.VERTEX_PROJECT_ID || VERTEX.project;
+  const location = process.env.VERTEX_LOCATION || VERTEX.location;
+  const host = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
+  const started = Date.now();
+  const res = await fetch(`https://${host}/v1/projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: VERTEX.maxOutputTokens },
+    }),
+    signal: AbortSignal.timeout(WRITER.timeoutMs),
+  });
+  const body = (await res.json().catch(() => ({}))) as {
+    candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] }; finishReason?: string }[];
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number };
+    error?: { message?: string };
+  };
+  if (!res.ok) throw new Error(`Vertex answered ${res.status}${body.error?.message ? `: ${body.error.message.slice(0, 200)}` : ""}`);
+  const text = (body.candidates?.[0]?.content?.parts ?? []).filter((p) => !p.thought).map((p) => p.text ?? "").join("");
+  if (!text) throw new Error(`Vertex returned no text (${body.candidates?.[0]?.finishReason ?? "no candidate"})`);
+  const u = body.usageMetadata ?? {};
+  const output = (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0);
+  const p = VERTEX.pricesPerMillion;
+  recordWriterCall({ result: text, usage: { input_tokens: u.promptTokenCount ?? 0, output_tokens: output }, total_cost_usd: ((u.promptTokenCount ?? 0) * p.input + output * p.output) / 1_000_000, duration_ms: Date.now() - started }, meta);
+  return text;
+}
+
 function callWriter(prompt: string, system: string, meta: { purpose: WriterCall["purpose"]; jobId: string }): Promise<string> {
   if (writerBackend() === "api") return callApi(prompt, system, meta);
+  if (writerBackend() === "vertex") return callVertex(prompt, system, meta);
   return new Promise((resolve, reject) => {
     mkdirSync(WRITER.cwd, { recursive: true });
     const child = spawn(

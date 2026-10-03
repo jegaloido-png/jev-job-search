@@ -35,7 +35,8 @@ export function outcomeOf(r: FillReport, maxPages: number): Outcome {
     if (reason === SIGN_IN_REASON || /login_required/.test(reason)) return { action: "blocked", reason: SIGN_IN_REASON, rememberSite: true };
     // A posting that has closed is not something the person can do by hand either.
     if (/page looks like: closed/.test(reason)) return { action: "skipped", reason: "the posting has closed", rememberSite: false };
-    return { action: "blocked", reason, rememberSite: /page looks like: job_description/.test(reason) };
+    // A posting page where no form was found is not a wall: the next posting on the same site may open fine.
+    return { action: "blocked", reason, rememberSite: false };
   }
   if (r.resolution?.verdict === "skip") return { action: "skipped", reason: r.resolution.reason, rememberSite: false };
   if (r.ready) return { action: "send", reason: null, rememberSite: false };

@@ -57,6 +57,7 @@ const SYSTEM = [
   "- Experience: every job from the facts, most recent first, with the bullets that speak to this posting. Projects: the ones that speak to it, with their bullets.",
   "- Cover letter, when asked: greeting, three or four paragraphs, closing. The closing is the sign-off words only (\"Sincerely,\" or \"Thank you for your time,\"); the name is printed under it by the page. Paragraph one names the role and one specific thing from the posting. The middle ties two or three concrete facts to what the posting asks for. The last says what the candidate wants to build there. It reads as the candidate typed it, follows the voice rules, and never claims to have done something the facts do not say. The company's own name and the posting's words are fine; nothing else that is not in the facts.",
   "- Plain words. No hype, no em dashes, no exclamation marks, no first-person in the resume bullets.",
+  "- Language: the resume is in Italian, as the candidate's own resume is. The cover letter is in the posting's language: Italian for an Italian posting, English for an English one.",
 ].join("\n");
 
 /** What the second pass is told to do with the first draft. It returns the same JSON shape, revised. */

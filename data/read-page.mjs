@@ -1,0 +1,22 @@
+// Opens a URL in the runner's Chrome (port 9333), waits, prints what the page says: its text, and any message box hidden or shown. Closes the tab.
+const url = process.argv[2];
+const wait = Number(process.argv[3] || 5000);
+const t = await fetch("http://127.0.0.1:9333/json/new?" + encodeURIComponent(url), { method: "PUT" }).then((r) => r.json());
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+await new Promise((r) => (ws.onopen = r));
+let id = 0;
+const send = (method, params = {}) => new Promise((res) => { const my = ++id; ws.addEventListener("message", function h(ev) { const m = JSON.parse(ev.data); if (m.id === my) { ws.removeEventListener("message", h); res(m.result); } }); ws.send(JSON.stringify({ id: my, method, params })); });
+const ev = async (expression) => (await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })).result.value;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await sleep(wait);
+console.log("URL", await ev("location.href"));
+console.log("TITLE", await ev("document.title"));
+const txt = await ev("document.body.innerText");
+console.log("TEXT len", txt.length);
+console.log(txt.slice(0, 1500));
+console.log("----- END -----");
+console.log(txt.slice(-600));
+console.log("----- MATCHES (textContent, incl hidden) -----");
+console.log(await ev(`[...document.querySelectorAll('body *')].filter(e=>e.children.length<3 && /grazie|inviat|ricevut|success|conferm|thank/i.test(e.textContent) && e.textContent.length<400).map(e=>e.tagName+'.'+e.className+' vis='+(e.offsetParent!==null)+' :: '+e.textContent.replace(/\s+/g,' ').trim()).slice(0,30).join('\n')`));
+if (!process.argv.includes("--keep")) await send("Page.close");
+process.exit(0);

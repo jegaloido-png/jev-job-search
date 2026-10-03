@@ -62,6 +62,11 @@ export const PROFILE_KEYS = {
   transgender: "Transgender identity question",
   current_company: "Current or most recent employer",
   current_title: "Current or most recent job title",
+  experience_start_date: "Start date (From) of the candidate's most recent job, in a work experience entry",
+  experience_end_date: "End date (To) of the candidate's most recent job, in a work experience entry",
+  experience_location: "City or office location of the candidate's most recent job, in a work experience entry",
+  experience_description: "Description of the duties of the candidate's most recent job, in a work experience entry",
+  experience_current: "Yes or no: the candidate still works in that most recent job (I currently work here)",
   years_of_experience: "Total years of professional experience",
   skills: "Technical skills or technologies, comma separated",
   spoken_languages: "Languages spoken",
@@ -119,9 +124,9 @@ export function valueFor(profile: Profile, key: ProfileKey): string | null {
     case "full_address":
       return `${profile.address.line1}, ${profile.address.city}, ${profile.address.regionCode} ${profile.address.postalCode}, ${profile.address.country}`;
     case "current_location": return `${profile.address.city}, ${profile.address.region}, ${profile.address.country}`;
-    case "linkedin_url": return profile.links.linkedin;
-    case "github_url": return profile.links.github;
-    case "website_url": return profile.links.website ?? profile.links.portfolio ?? profile.links.github;
+    case "linkedin_url": return profile.links.linkedin ?? null;
+    case "github_url": return profile.links.github ?? null;
+    case "website_url": return profile.links.website ?? profile.links.portfolio ?? profile.links.github ?? null;
     case "school": return edu.school;
     case "degree": return edu.degree;
     case "major": return edu.field;
@@ -155,6 +160,11 @@ export function valueFor(profile: Profile, key: ProfileKey): string | null {
     case "transgender": return yes(profile.demographics.transgender);
     case "current_company": return job?.company ?? null;
     case "current_title": return job?.title ?? null;
+    case "experience_start_date": return job ? monthYear(job.start) : null;
+    case "experience_end_date": return job && !job.current ? monthYear(job.end) : null;
+    case "experience_location": return job?.location ?? null;
+    case "experience_description": return job?.bullets.join(" ") || null;
+    case "experience_current": return job ? (job.current ? "Yes" : "No") : null;
     case "years_of_experience": return String(yearsOfExperience(profile));
     case "skills": return [...profile.skills.languages, ...profile.skills.frameworks, ...profile.skills.tools].join(", ");
     case "spoken_languages": return profile.spokenLanguages.map((l) => `${l.name} (${l.level})`).join(", ");
@@ -173,6 +183,12 @@ export function valueFor(profile: Profile, key: ProfileKey): string | null {
     case "referral_name": return null;
     case "hackathons": return profile.facts.find((f) => /hackathon/i.test(f)) ?? null;
   }
+}
+
+/** "2022-01" as "January 2022", the way the education dates are given. */
+function monthYear(s: string): string | null {
+  const m = /^(\d{4})-(\d{2})/.exec(s);
+  return m ? `${monthName(Number(m[2]))} ${m[1]}` : null;
 }
 
 /** Whole years of experience across internships and founder roles, rounded down, minimum 0. */
