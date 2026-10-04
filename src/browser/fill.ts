@@ -9,7 +9,7 @@ import type { Method } from "../knowledge/sites.js";
 import type { Profile } from "../profile/schema.js";
 import { sleep, type Page } from "./cdp.js";
 import { pickDate } from "./calendar.js";
-import { showsValue } from "../util/dates.js";
+import { isoOf, showsValue, toYmd } from "../util/dates.js";
 import { fillDropdown, fillDropdownByClicking, fillPanel } from "./dropdowns.js";
 import type { Failure, Fill } from "./report.js";
 import { controlStates, inFront, norm, script, shownValues, trace, type Point } from "./session.js";
@@ -23,8 +23,34 @@ export type FillGuide = {
   landed: (selector: string, method: Method) => void;
 };
 
-export async function applyFills(page: Page, fills: Fill[], profile: Profile, guide?: FillGuide): Promise<Failure[]> {
+/** The candidate's city picked where the plan named the region: an Italian list of regions and provinces takes the province (dropdowns.ts). */
+export const provinceForRegion = (want: string, shown: string, profile?: Profile) =>
+  !!profile && want.trim().toLowerCase() === profile.address.region.trim().toLowerCase() && shown.trim().toLowerCase() === profile.address.city.trim().toLowerCase();
+
+export async function applyFills(page: Page, given: Fill[], profile: Profile, guide?: FillGuide): Promise<Failure[]> {
+  // A browser's own date box (type=date) takes only yyyy-mm-dd, whatever it shows: "January 2022" is written as 2022-01-01.
+  let fills = given.map((f) => (f.kind === "date" && toYmd(f.value) ? { ...f, value: isoOf(toYmd(f.value)!) } : f));
   const failed: Failure[] = [];
+  // A date drawn as one box per part (Workday's MM / DD / YYYY): the first part is clicked and each part typed in turn,
+  // in the order the boxes stand; the boxes move on by themselves.
+  for (const f of fills.filter((x) => x.kind === "date")) {
+    const parts = await page.awj<(Point & { part: string })[]>("spinParts", f.selector);
+    if (parts.length < 2) continue;
+    fills = fills.filter((x) => x !== f);
+    const d = toYmd(f.value);
+    if (!d || !parts[0]?.ok) {
+      failed.push({ selector: f.selector, why: d ? "the date boxes cannot be clicked" : `"${f.value}" is not a date` });
+      continue;
+    }
+    const of: Record<string, string> = { m: String(d.month).padStart(2, "0"), d: String(d.day).padStart(2, "0"), y: String(d.year) };
+    await inFront(page, async () => {
+      await page.click(parts[0]!.x, parts[0]!.y);
+      for (const p of parts) await page.typeKeys(of[p.part] ?? "");
+      await page.key("Tab");
+    });
+    await sleep(BROWSER.pollMs * 2);
+    if (!(await shownValues(page, [f.selector]))[0]) failed.push({ selector: f.selector, why: "the date boxes did not keep the date" });
+  }
   const how = new Map<string, Method>();
   const panels = new Set<string>();
   const hints = [profile.address.city, profile.address.region, profile.address.regionCode, profile.address.country];
@@ -38,7 +64,7 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
   const plain = fills.filter((f) => f.kind !== "combobox" && f.kind !== "calendar");
   // A control known to ignore a value set from script is typed into straight away: no failed first try, no waiting.
   // A date goes in key by key too: date pickers keep only what they saw typed, whatever the box shows.
-  const typeFirst = plain.filter((f) => TYPED_KINDS.has(f.kind) && (guide?.prefer(f.selector) === "typed" || DATE_TYPED.test(f.value)));
+  const typeFirst = plain.filter((f) => TYPED_KINDS.has(f.kind) && (guide?.prefer(f.selector) === "typed" || (f.kind !== "date" && DATE_TYPED.test(f.value))));
   const simple = plain.filter((f) => !typeFirst.includes(f));
   page.takeWrites();
   const [first, ...rest] = simple;
@@ -129,14 +155,14 @@ export async function applyFills(page: Page, fills: Fill[], profile: Profile, gu
       continue;
     }
     // A typed box must show the value it was given, in whatever shape the site writes it. Anything else is a retry.
-    const landed = !!shown[i] && (panels.has(f.selector) ? true : !(TYPED_KINDS.has(f.kind) || f.kind === "combobox") || showsValue(f.value, shown[i] ?? ""));
+    const landed = !!shown[i] && (panels.has(f.selector) ? true : !(TYPED_KINDS.has(f.kind) || f.kind === "combobox") || showsValue(f.value, shown[i] ?? "") || provinceForRegion(f.value, shown[i] ?? "", profile));
     if (landed) guide?.landed(f.selector, how.get(f.selector) ?? "script");
     if (landed || failed.some((x) => x.selector === f.selector)) continue;
     if (f.kind === "checkbox" && !/^(true|yes|1|on|checked)$/i.test(f.value)) continue;
     const why = f.kind === "combobox" ? await fillDropdownByClicking(page, f.selector, f.value, hints) : TYPED_KINDS.has(f.kind) ? await typeInto(page, f.selector, f.value) : f.kind === "radio" ? await clickGroupOption(page, f.selector, f.value) : "the page did not keep the value";
     const after = (await shownValues(page, [f.selector]))[0] ?? "";
     if (why || !after) failed.push({ selector: f.selector, why: why ?? "the page did not keep the value" });
-    else if ((TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !showsValue(f.value, after)) failed.push({ selector: f.selector, why: `the box shows "${after.slice(0, 40)}" instead of "${f.value.slice(0, 40)}"` });
+    else if ((TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !showsValue(f.value, after) && !provinceForRegion(f.value, after, profile)) failed.push({ selector: f.selector, why: `the box shows "${after.slice(0, 40)}" instead of "${f.value.slice(0, 40)}"` });
     else guide?.landed(f.selector, TYPED_KINDS.has(f.kind) ? "typed" : "clicked");
   }
   return failed;
@@ -170,12 +196,22 @@ function typeInto(page: Page, selector: string, value: string): Promise<string |
       } else await page.type(value);
       // Leave the box the way a person does. Some phone boxes throw away what was typed when focus is taken from them by script.
       // A date box is left with Escape instead: its calendar closes, and Tab would land on the next control and open it.
+      // A box that Escape puts back the way it was (UI5's date picker on SuccessFactors) is typed again and left with Tab.
       if (DATE_TYPED.test(value)) {
         await page.key("Escape");
+        await sleep(BROWSER.pollMs);
+        if (!(await page.awj<string>("shown", selector)) && (await page.awj<boolean>("focus", selector))) {
+          await page.evaluate("window.__awj.selectAll()");
+          await page.key("Backspace");
+          await page.typeKeys(value);
+          await page.key("Tab");
+        }
         await page.evaluate("window.__awj.blur()");
       } else await page.key("Tab");
       await sleep(BROWSER.pollMs);
-      if (await page.awj<string>("shown", selector)) break;
+      const kept = await page.awj<string>("shown", selector);
+      if (DATE_TYPED.test(value)) trace(`typed date into ${selector.slice(-40)}, try ${attempt + 1}: the box shows "${kept}"`);
+      if (kept) break;
     }
     await page.evaluate("window.__awj.blur()");
     return null;

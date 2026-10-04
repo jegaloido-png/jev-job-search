@@ -11,19 +11,20 @@ import { isApplicationForm, type DumpedField, type FieldsDump, type FillPlan } f
 import { hasChoosableOptions, mapForm, startDayOf } from "../forms/mapForm.js";
 import { decidePageState } from "../forms/pageState.js";
 import type { JevClient } from "../jev/client.js";
-import { applyUrlFor, greenhouseFallbackUrl, type Job } from "../jobs/normalize.js";
+import { applyUrlFor, greenhouseFallbackUrl, hostIs, type Job } from "../jobs/normalize.js";
 import type { Profile } from "../profile/schema.js";
 import { loadMemory, recallExact, recallForm, recallSameFields, recallSimilar, remember, saveMemory, type Recalled } from "../answers/memory.js";
 import { contextFingerprint, resolveOpenFields, type OpenField, type Resolution } from "../answers/resolve.js";
 import type { QueueEntry } from "../jobs/queue.js";
 import { closeTab, ensureBrowser, newTab, Page, sleep } from "./cdp.js";
 import { candidateOptions, closestOptions, readDropdownOptions } from "./dropdowns.js";
-import { applyFills, TYPED_KINDS, uploadFile, type FillGuide } from "./fill.js";
+import { applyFills, provinceForRegion, TYPED_KINDS, uploadFile, type FillGuide } from "./fill.js";
 import { learn, notesFor, signatureOf, type Method } from "../knowledge/sites.js";
 import { showsValue, toYmd } from "../util/dates.js";
 import { declineCookieBanner } from "./submit.js";
+import { atAccountWall, passAccountWall } from "./account.js";
 import { blockedReport, comparePages, emptyRequired, emptyRequiredFields, isClean, isReady, loadPlan, loadReport, pickNext, savePlan, saveReport, SIGN_IN_REASON, splitFailures, type Failure, type FieldReport, type Fill, type FillReport } from "./report.js";
-import { controlStates, dump, goto, inFront, inTurn, install, loadSession, pageFor, saveSession, settle, shownValues, trace, type Point } from "./session.js";
+import { buttonPoint, controlStates, dump, goto, inFront, inTurn, install, loadSession, pageFor, saveSession, settle, shownValues, trace, type Point } from "./session.js";
 
 /** The text of a button that leads from a posting to its form. */
 // A short label that starts with an apply verb: "Apply for this job", "Candidati per questo ruolo", "Candidarsi alla
@@ -34,7 +35,7 @@ import { controlStates, dump, goto, inFront, inTurn, install, loadSession, pageF
 // "I'm interested" in the posting's language ("Mi interessa", "Ich bin interessiert", "Me interesa").
 const APPLY_BUTTON =
   "^\\s*(?!.*(linkedin|indeed|xing|google|facebook|seek|later|share|condividi))" +
-  "((apply|start (your )?application|submit (your )?application|i'm interested|i am interested|" +
+  "((apply|start (your )?application|submit (your )?application|(continue|resume) (your |my )?application|(riprendi|continua) (la )?(tua )?candidatura|bewerbung fortsetzen|i'm interested|i am interested|" +
   "mi interessa|sono interessat[oa]|ich bin interessiert|je suis intéressée?|ça m'intéresse|me interesa|estoy interesad[oa]|tenho interesse|estou interessad[oa]|ik ben geïnteresseerd|" +
   "candidati|candidarsi|candidatati|candidatura|invia (la tua |la )?candidatura|invia (il tuo )?cv|inviaci il tuo cv|applica|" +
   "presenta (la )?(tua )?candidatura|invia (la )?(tua )?domanda|fai domanda|" +
@@ -49,37 +50,130 @@ const APPLY_BUTTON =
 const APPLICATION_CONSENT = "^\\s*(i accept|i agree|accetto|acconsento|ich stimme zu|j'accepte)\\s*$";
 const CONSENT_PAGE = /personal data|dati personali|personenbezogene|données personnelles/i;
 
+/** The way into a form that reads the resume and fills the form from it, offered next to "Apply manually" (Workday). */
+const RESUME_AUTOFILL = "^\\s*(autofill with (your )?(resume|cv)|upload (your )?(resume|cv) to apply|compila (automaticamente )?con (il )?(tuo )?(cv|curriculum)|candidati con (il )?(tuo )?cv|mit lebenslauf (automatisch )?ausfüllen|remplir (automatiquement )?avec (mon |votre )?cv|autocompletar con (tu )?(cv|currículum))\\s*$";
+
+/** The site a host belongs to: its last two labels, three under a country's second level ("co.uk", "com.br"). */
+const siteOfHost = (host: string) => {
+  const parts = host.toLowerCase().replace(/\.$/, "").split(".");
+  const n = parts.length >= 3 && /^(co|com|net|org|gov|ac|edu)$/.test(parts[parts.length - 2] ?? "") ? 3 : 2;
+  return parts.slice(-n).join(".");
+};
+const hostOfUrl = (url: string) => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+};
+/**
+ * Where a step of opening the form may not go: a page on another site that is not an ATS (a job board, a social
+ * sign-in, a home page). The posting's own site and every ATS are fine. Gives the host when the step leaves, or null.
+ */
+export function offSite(postingUrl: string, to: string): string | null {
+  const from = hostOfUrl(postingUrl);
+  const host = hostOfUrl(to);
+  if (!host || !/^https?:/.test(to)) return to.split(":")[0] || "an unknown page";
+  if (siteOfHost(host) === siteOfHost(from) || RUN.atsDomains.some((d) => hostIs(host, d))) return null;
+  return host;
+}
+const leftTheBoard = (host: string) => new Error(`the Apply link leads off the board to ${host}: not followed`);
+
 /** Lands on the page that holds the form: the URL itself, an embedded ATS frame, or behind an Apply button. */
 async function openForm(page: Page, job: Job, resume?: string): Promise<FieldsDump> {
   await goto(page, applyUrlFor(job));
-  let d = await dump(page);
+  return reachForm(page, job, resume, await dump(page));
+}
+
+/**
+ * From the page the tab shows, on to the form: a cookie banner answered, a frame followed, an Apply button pressed. A
+ * sign-in page stops it: the account is the account step's (account.ts), which then calls this again from where it left.
+ */
+async function reachForm(page: Page, job: Job, resume: string | undefined, d: FieldsDump): Promise<FieldsDump> {
   // A cookie banner over the Apply button takes its click, so it is answered first too.
   if (!isApplicationForm(d) || (await formFolded(page, d))) d = await declineCookies(page, d);
-  for (let hop = 0; hop < 4 && (!isApplicationForm(d) || (await formFolded(page, d))); hop++) {
-    const frame = d.frames[0];
-    const consent = !frame && CONSENT_PAGE.test(await page.evaluate<string>("window.__awj.pageText()")) ? await page.awj<Point>("clickByText", APPLICATION_CONSENT) : null;
-    if (frame) {
+  let expanded = false;
+  for (let hop = 0; hop < 4 && !d.hasPassword && (!isApplicationForm(d) || (await formFolded(page, d))); hop++) {
+    // A form folded into sections ("Expand all sections" on SuccessFactors) is opened before anything is pressed: its
+    // own Apply at the bottom sends the application, and is never pressed to bring up a form that is already here.
+    if (!expanded && (expanded = await expandSections(page))) {
+      d = await dump(page);
+      trace(`open hop ${hop}: sections expanded, ${d.fields.length} fields, form=${isApplicationForm(d)}`);
+      continue;
+    }
+    // A site that offers to read the resume into its form (Workday's "Autofill with Resume") is given it that way: the
+    // form comes up filled from the file, its work history included.
+    const autofill = await page.awj<Point>("clickByText", RESUME_AUTOFILL);
+    const frame = autofill.ok ? undefined : d.frames[0];
+    const consent = !frame && !autofill.ok && CONSENT_PAGE.test(await page.evaluate<string>("window.__awj.pageText()")) ? await page.awj<Point>("clickByText", APPLICATION_CONSENT) : null;
+    if (autofill.ok) {
+      const away = autofill.href ? offSite(applyUrlFor(job), autofill.href) : null;
+      if (away) throw leftTheBoard(away);
+      await page.click(autofill.x, autofill.y);
+      await settle(page);
+      await install(page);
+    } else if (frame) {
       await goto(page, frame);
     } else if (consent?.ok) {
       await page.click(consent.x, consent.y);
       await settle(page);
       await install(page);
     } else {
-      const p = await page.awj<Point>("clickByText", APPLY_BUTTON);
+      // The button is measured until it holds still: a cookie banner closing or a box unfolding moves it, and a click
+      // on where it was lands on something else (SuccessFactors' company sites: the job-alert box under it).
+      // A layer drawn over the page while it loads (SuccessFactors' company sites: "loading") takes the click: the
+      // runner waits until the point reaches the button itself.
+      let p = await page.awj<Point & { clear?: boolean }>("clickByText", APPLY_BUTTON, { content: true });
+      for (let look = 0; p.ok && look < 24; look++) {
+        await sleep(250);
+        const again = await page.awj<Point & { clear?: boolean }>("clickByText", APPLY_BUTTON, { content: true });
+        if (!again.ok) break;
+        const still = Math.abs(again.x - p.x) < 2 && Math.abs(again.y - p.y) < 2;
+        p = again;
+        if (still && p.clear !== false) break;
+      }
+      if (p.ok && p.clear === false) trace("apply button: still covered by another layer, clicking anyway");
       if (!p.ok) break;
       if (p.href) {
-        // A link is followed in this tab. Clicking one that opens a new tab would leave the runner looking at the old page.
-        await goto(page, p.href);
-      } else {
-        await page.click(p.x, p.y);
+        const away = offSite(applyUrlFor(job), p.href);
+        if (away) throw leftTheBoard(away);
+        // The link is clicked like a person would: some sites run their own step on the click (SuccessFactors' company
+        // sites send a link opened directly back to their home page). A click that leaves this tab where it was (the
+        // link opens a new tab) is made good by following the link in this tab; the other tab is closed with the job's.
+        const was = await page.evaluate<string>("location.href");
+        // In front, like a person's click: a tab behind another one does not run some sites' own step on the click.
+        await inFront(page, () => page.click(p.x, p.y));
         await settle(page);
+        // The click's own step can take a few seconds before the page moves (SuccessFactors' company sites go through
+        // their apply page on to the sign-in): the link is followed by hand only when the tab really stayed.
+        let now = await page.evaluate<string>("location.href").catch(() => was);
+        for (const until = Date.now() + 8_000; now === was && Date.now() < until; ) {
+          await sleep(400);
+          now = await page.evaluate<string>("location.href").catch(() => was);
+        }
+        trace(`apply link: clicked at ${Math.round(p.x)},${Math.round(p.y)}, the tab ${now === was ? "stayed: following the link" : `moved to ${now.replace(/[?#].*/, "")}`}`);
+        if (now !== was) await settle(page);
+        if (now === was) await goto(page, p.href, was);
+        else {
+          const off = offSite(applyUrlFor(job), now);
+          if (off) throw leftTheBoard(off);
+          await install(page);
+        }
+      } else {
+        await inFront(page, () => page.click(p.x, p.y));
+        // A button that stays on the page (it opens a list of ways to apply) is not the one pressed next time.
+        await page.awj("markPressed").catch(() => false);
+        await settle(page);
+        // A button can lead off the site too: the runner does not stay there.
+        const away = offSite(applyUrlFor(job), await page.evaluate<string>("location.href"));
+        if (away) throw leftTheBoard(away);
         await install(page);
         // A form that unfolds in place animates open; read it once it has stopped moving.
         await unfolded(page);
       }
     }
     d = await dump(page);
-    trace(`open hop ${hop}: ${frame ? "frame" : consent?.ok ? "consent" : "apply button"}, ${d.fields.length} fields, form=${isApplicationForm(d)}`);
+    trace(`open hop ${hop}: ${autofill.ok ? "resume autofill" : frame ? "frame" : consent?.ok ? "consent" : "apply button"}, ${d.fields.length} fields, form=${isApplicationForm(d)}`);
   }
   // A careers page that shows the job without the form: go to the board's own form for the same posting.
   const fallback = !isApplicationForm(d) && !d.hasPassword ? greenhouseFallbackUrl(job) : null;
@@ -88,6 +182,7 @@ async function openForm(page: Page, job: Job, resume?: string): Promise<FieldsDu
     d = await dump(page);
   }
   d = await declineCookies(page, d);
+  if (!expanded && (await expandSections(page))) d = await dump(page);
   if (resume && !isApplicationForm(d) && d.fields.length === 1 && d.fields[0]?.kind === "file" && !(await formFolded(page, d))) d = await resumeFirst(page, d, resume);
   if (isApplicationForm(d) && (await page.awj<number>("exposeFileButtons")) > 0) d = await dump(page);
   return d;
@@ -140,6 +235,22 @@ async function formFolded(page: Page, d: FieldsDump): Promise<boolean> {
   );
 }
 
+/** The button that opens every folded section of a form at once. */
+const EXPAND_ALL =
+  "^\\s*(expand all( sections)?|show all sections|espandi tutt[eoi]( le sezioni)?|mostra tutte le sezioni|alle (abschnitte )?(erweitern|aufklappen|einblenden)|" +
+  "tout (développer|déplier)|développer toutes les sections|expandir todo|expandir todas las secciones)\\s*$";
+
+/** Presses "Expand all sections" when the page has it, and waits for the sections to open. True when pressed. */
+async function expandSections(page: Page): Promise<boolean> {
+  const b = await page.awj<Point>("clickByText", EXPAND_ALL);
+  if (!b.ok || b.href) return false;
+  await inFront(page, () => page.click(b.x, b.y));
+  await unfolded(page);
+  await settle(page);
+  await install(page);
+  return true;
+}
+
 /** Waits until no element is mid-animation and the page's height stops changing, at most a few seconds. */
 async function unfolded(page: Page): Promise<void> {
   let last = -1;
@@ -185,14 +296,25 @@ export async function fillJob(jev: JevClient, profile: Profile, job: Job): Promi
     if (old) await closeTab(old.targetId);
     return newTab("about:blank");
   });
+  // The tab is the job's from the start, so a form that fails to open still has its tab closed with the job.
+  saveSession({ ...loadSession(), [job.id]: { targetId: target.id, url: "about:blank" } });
   const page = await Page.attach(target);
   const seconds = () => (Date.now() - started) / 1000;
   try {
     let d = await openForm(page, job, profile.resume.path);
+    // A page that draws its form late and in parts (Workday after "Continue Application": the top boxes, the button, then
+    // the rest) is read once it has fields and a button and has held still for two looks a second apart.
+    for (let still = 0, until = Date.now() + BROWSER.settleMs; !d.hasPassword && Date.now() < until && (still < 2 || !d.fields.length || !d.submitSelectors.length); ) {
+      await sleep(1_000);
+      await install(page);
+      const again = await dump(page);
+      still = pageSignature(again) === pageSignature(d) ? still + 1 : 0;
+      d = again;
+    }
     trace(`${job.company}: form open ${Date.now() - started}ms, ${d.fields.length} fields`);
     // Read and written in one synchronous step, so jobs filled side by side do not overwrite each other.
     saveSession({ ...loadSession(), [job.id]: { targetId: target.id, url: d.url } });
-    if (!isApplicationForm(d) && !d.hasPassword) {
+    if (!isApplicationForm(d) && !d.hasPassword && !(await atAccountWall(page, d))) {
       // Job boards answer bursts with an error page. One unhurried second try settles most of them.
       const first = await decidePageState(jev, await page.evaluate<string>("window.__awj.pageText()"), d.url, job.id);
       if (first.state === "error" || first.state === "other") {
@@ -201,12 +323,30 @@ export async function fillJob(jev: JevClient, profile: Profile, job: Job): Promi
         d = await openForm(page, job, profile.resume.path);
       }
     }
-    // A password box means a sign-in or account page. Nothing is typed into it. The job is left for the person.
-    if (d.hasPassword) return saveReport(blockedReport(job, SIGN_IN_REASON, d.url, seconds()));
+    // A sign-in or account page: the account kept for the site signs in, or one is made with the candidate's mailbox.
+    // Twice at most: going back to the posting after an activation link meets the sign-in once more.
+    // A sign-up form that is the application too keeps its password boxes, already typed by the account step.
+    let signUpForm = false;
+    for (let pass = 0; pass < 2 && (await atAccountWall(page, d)); pass++) {
+      const passed = await passAccountWall(page, jev, profile, job, d);
+      if (typeof passed === "string") return saveReport(blockedReport(job, `${SIGN_IN_REASON}: ${passed}`, d.url, seconds()));
+      if ("signUpForm" in passed) {
+        d = passed.signUpForm;
+        signUpForm = true;
+        break;
+      }
+      d = await reachForm(page, job, profile.resume.path, passed);
+      saveSession({ ...loadSession(), [job.id]: { targetId: target.id, url: d.url } });
+      trace(`${job.company}: past the account wall ${Date.now() - started}ms, ${d.fields.length} fields`);
+    }
+    if (d.hasPassword && !signUpForm) return saveReport(blockedReport(job, SIGN_IN_REASON, d.url, seconds()));
     if (!isApplicationForm(d) && removedPosting(job, d.url)) return saveReport(blockedReport(job, "no form found, page looks like: closed", d.url, seconds()));
     if (!isApplicationForm(d)) {
       const state = await decidePageState(jev, await page.evaluate<string>("window.__awj.pageText()"), d.url, job.id);
-      return saveReport(blockedReport(job, `no form found, page looks like: ${state.state}`, d.url, seconds()));
+      // A form the quick test does not know (a later page of a long form, opened again: Workday's "My Information" with
+      // the email shown as text) is still a form when the page reads as one and has fields to fill.
+      if (!(state.state === "application_form" && d.fields.length >= 2)) return saveReport(blockedReport(job, `no form found, page looks like: ${state.state}`, d.url, seconds()));
+      trace(`${job.company}: the page reads as an application form: filling its ${d.fields.length} fields`);
     }
     return await fillPage(page, jev, profile, job, d, { page: 1, earlier: [], started });
   } finally {
@@ -320,8 +460,15 @@ async function fillPage(page: Page, jev: JevClient, profile: Profile, job: Job, 
   }
   failedRaw = [...(await secondLook(page, jev, profile, job, d, plan, failedRaw)), ...uploadFailures];
   failedRaw = await followUp(page, jev, profile, job, d, plan, failedRaw);
+  // A page read before its buttons were drawn (Workday draws "Save and Continue" last) is read again for them.
+  if (!plan.submitSelectors.length) {
+    await page.key("Escape").catch(() => undefined);
+    const again = await dump(page);
+    d.submitSelectors = again.submitSelectors;
+    plan.submitSelectors = again.submitSelectors;
+  }
   savePlan(job.id, d, plan);
-  const read = await readBack(page, d, plan, failedRaw, uploaded);
+  const read = await readBack(page, d, plan, failedRaw, uploaded, profile);
   guide.learn([...read.failed, ...read.leftBlank]);
   const partial = { jobId: job.id, company: job.company, title: job.title, ats: job.ats, ...read, takeHome: d.takeHome, page: at.page, earlier: at.earlier, hasNext: !!pickNext(plan.submitSelectors), seconds: (Date.now() - at.started) / 1000, jevCostUsd: (at.jevCostUsd ?? 0) + plan.jevCostUsd };
   return saveReport({ ...partial, ready: isReady(partial) });
@@ -342,15 +489,21 @@ async function followUp(page: Page, jev: JevClient, profile: Profile, job: Job, 
       const to = (selector: string) => moved.get(selector) ?? selector;
       for (const list of [d.fields, plan.fields, plan.fills, plan.drafts, plan.reviews, plan.uploads, out]) for (const f of list) f.selector = to(f.selector);
     }
-    d.submitSelectors = now.submitSelectors;
-    plan.submitSelectors = now.submitSelectors;
+    // A look taken while a list is open over the form can miss its buttons; the ones known stay then.
+    if (now.submitSelectors.length) {
+      d.submitSelectors = now.submitSelectors;
+      plan.submitSelectors = now.submitSelectors;
+    }
     if (!fresh.length) break;
     trace(`${job.company}: ${fresh.length} new field(s) appeared: ${fresh.map((f) => f.label.slice(0, 30)).join(" | ")}`);
     // Ids are per read of the page, so the new fields get ids of their own.
     const added = fresh.map((f) => ({ ...f, id: `r${round}${f.id}` }));
     await readDropdownOptions(page, added);
     const more = await mapForm(jev, profile, job, { ...now, fields: added });
-    out = [...out, ...(await applyFills(page, more.fills, profile, guideFor({ ...now, fields: added })))];
+    const late = await applyFills(page, more.fills, profile, guideFor({ ...now, fields: added }));
+    // A dropdown among them that refused its value gets the same second look as the first ones: its whole list, and JEV
+    // chooses there ("Laurea triennale" against Workday's "Bachelor's Degree").
+    out = [...out, ...(late.length ? await secondLook(page, jev, profile, job, { ...now, fields: added }, more, late) : late)];
     // A file box that appears once the resume is in (an upload widget redrawn around the file) is the same box: the
     // resume is not given twice. Any other new file box is given its file like the first ones.
     // Such a box is left out of the plan altogether: it is the first box, already read back with its file.
@@ -431,7 +584,7 @@ export async function nextPage(jev: JevClient, profile: Profile, job: Job, opts:
     await page.writesSettled(BROWSER.saveMs);
     const was = pageSignature(before);
     await inFront(page, async () => {
-      const p = await page.awj<Point>("point", next.selector);
+      const p = await buttonPoint(page, next);
       if (!p.ok) throw new Error(`The "${next.text}" button is not on the page.`);
       await page.click(p.x, p.y);
     });
@@ -456,6 +609,19 @@ export async function nextPage(jev: JevClient, profile: Profile, job: Job, opts:
     await settle(page);
     await install(page);
     d = await dump(page);
+    // A form that draws its next page in steps (Workday shows the old page's last box while the new one loads) is read
+    // once its controls have stayed the same for two looks in a row.
+    for (let still = 0, until = Date.now() + BROWSER.settleMs; still < 2 && Date.now() < until; ) {
+      await sleep(1_000);
+      try {
+        await install(page);
+        const again = await dump(page);
+        still = pageSignature(again) === pageSignature(d) ? still + 1 : 0;
+        d = again;
+      } catch {
+        still = 0; // mid-navigation
+      }
+    }
     const earlier = [...r.earlier, ...r.fields];
     const cost = r.jevCostUsd;
     if (d.hasPassword) return saveReport({ ...blockedReport(job, SIGN_IN_REASON, d.url), earlier, page: r.page + 1 });
@@ -517,7 +683,7 @@ async function secondLook(page: Page, jev: JevClient, profile: Profile, job: Job
 }
 
 /** Reads the page back against the plan: what each field shows, what did not land, what is still empty. */
-async function readBack(page: Page, d: FieldsDump, plan: FillPlan, failedRaw: Failure[], uploaded = new Set<string>()): Promise<Pick<FillReport, "url" | "state" | "reason" | "fields" | "drafts" | "reviews" | "failed" | "leftBlank" | "missingRequired">> {
+async function readBack(page: Page, d: FieldsDump, plan: FillPlan, failedRaw: Failure[], uploaded = new Set<string>(), profile?: Profile): Promise<Pick<FillReport, "url" | "state" | "reason" | "fields" | "drafts" | "reviews" | "failed" | "leftBlank" | "missingRequired">> {
   const shown = await shownValues(page, plan.fields.map((f) => f.selector));
   // A board can redraw its upload control once the file is in (HiBob), so the file's name on the page counts too.
   const onPage = await Promise.all(plan.fields.map((f) => (f.action === "upload" && f.value ? page.awj<boolean>("showsFile", path.basename(f.value)) : Promise.resolve(false))));
@@ -533,7 +699,7 @@ async function readBack(page: Page, d: FieldsDump, plan: FillPlan, failedRaw: Fa
     const shownNow = fields[i]?.shown ?? "";
     if ((f.action === "fill" || f.action === "upload") && !shownNow) {
       failed.push({ selector: f.selector, why: states[i] === "missing" ? "the control is no longer on the page" : "the value is not confirmed on the page" });
-    } else if (f.action === "fill" && f.value && (TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !isPanelField(f.selector) && !showsValue(f.value, shownNow)) {
+    } else if (f.action === "fill" && f.value && (TYPED_KINDS.has(f.kind) || f.kind === "combobox") && !isPanelField(f.selector) && !showsValue(f.value, shownNow) && !provinceForRegion(f.value, shownNow, profile)) {
       failed.push({ selector: f.selector, why: `the box shows "${shownNow.slice(0, 40)}" instead of "${f.value.slice(0, 40)}"` });
     }
   });
@@ -593,7 +759,9 @@ export async function resolveJob(profile: Profile, entry: QueueEntry | null, job
     const useMemory = MEMORY.enabled && !opts.fresh;
     const mem = useMemory ? loadMemory() : null;
     // The same form with the same open fields was resolved before: what was read then is what goes in now.
-    const sameForm = mem ? recallForm(mem, memoryKey, fingerprint, openFields) : null;
+    const remembered = mem ? recallForm(mem, memoryKey, fingerprint, openFields) : null;
+    // Read again only when every answer it holds still fits its list.
+    const sameForm = remembered && remembered.answers.every((a) => { const f = open.get(a.selector); return !f || fitsOptions(f, a.value); }) ? remembered : null;
     let recalled = new Map<string, Recalled>();
     let resolution: Resolution;
     if (sameForm) {
@@ -609,6 +777,12 @@ export async function resolveJob(profile: Profile, entry: QueueEntry | null, job
           const similar = await recallSimilar(opts.jev, mem, fingerprint, company, rest, `same-question:${jobId}`).catch(() => new Map<string, Recalled>());
           for (const [selector, hit] of similar) recalled.set(selector, hit);
         }
+      }
+      // An answer remembered from another form is kept for a list only when this list has it ("Corporate Website" from one
+      // company's "How did you hear about us?" is not among the next company's options).
+      for (const f of openFields) {
+        const hit = recalled.get(f.selector);
+        if (hit && !fitsOptions(f, hit.value)) recalled.delete(f.selector);
       }
       const rest = openFields.filter((f) => !recalled.has(f.selector));
       const settled = openFields.filter((f) => recalled.has(f.selector) && f.kind !== "checkbox").map((f) => ({ label: withQuestion(f.selector, f.label), value: recalled.get(f.selector)?.value ?? "" }));
@@ -695,4 +869,11 @@ export async function inspect(jobId: string): Promise<{ fields: FieldReport[]; e
   } finally {
     page.close();
   }
+}
+
+/** True when a value suits an open field: any value for a field with no list, one of the list's options otherwise. */
+function fitsOptions(f: OpenField, value: string): boolean {
+  if (!f.options.length || f.kind === "checkbox") return true;
+  const n = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  return f.options.some((o) => n(o) === n(value));
 }

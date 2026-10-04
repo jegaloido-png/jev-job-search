@@ -43,7 +43,7 @@ describe("the writer's prompt", () => {
     expect(contextFingerprint({ ...profile, facts: [...profile.facts, "A new fact."] })).not.toBe(contextFingerprint(profile));
   });
   it("keeps what changes per form in the prompt: the job, what is filled, what is open", () => {
-    expect(Object.keys(prompt)).toEqual(["job", "already_filled", "open_fields"]);
+    expect(Object.keys(prompt)).toEqual(["today", "work_permit", "job", "already_filled", "open_fields"]);
     expect(prompt.already_filled).toEqual([{ label: "Email", value: "ada@example.com" }]);
     expect(prompt.open_fields[0]).toMatchObject({ selector: "#q1", required: true, maxLength: 500 });
   });

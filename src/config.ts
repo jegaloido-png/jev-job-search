@@ -52,6 +52,8 @@ export const PATHS = {
   /** The person's own files, at the top of the project: the resume to send, a transcript, and the tailored pairs under tailored/. */
   documentsDir: path.join(ROOT, "documents"),
   browserScripts: path.join(ROOT, "src", "forms"),
+  /** The accounts made on careers sites that want one before the form: site, company, email and password. Never committed. */
+  accounts: path.join(ROOT, "data", "accounts.json"),
 } as const;
 
 /** Loads KEY=value lines from .env into process.env without overriding existing values. */
@@ -160,7 +162,7 @@ export const RECENCY_FLOOR = 0.7;
 
 export const FORM = {
   /** Part of every cached plan's key: raised when the planning rules change, so old plans are not reused. */
-  planVersion: 15,
+  planVersion: 17,
   /** Most sections filled one entry at a time (Experience, Education) that are given an entry on one page. */
   maxEntrySections: 4,
   /** JEV confidence at or above which a mapping is applied without note. */
@@ -228,6 +230,25 @@ export const BROWSER = {
    */
   clickHoverMs: 80,
   clickHoldMs: 60,
+} as const;
+
+/** Accounts on careers sites that want one before the form (Workday, SuccessFactors). See src/browser/account.ts. */
+export const ACCOUNT = {
+  /** Steps through a sign-in wall before it is given up: a create, a sign-in, a mailed link, a way back each count. */
+  maxRounds: 10,
+  maxCreates: 2,
+  /** Sign-ins with the kept password. A third wrong one locks many accounts. */
+  maxSignIns: 2,
+  maxLinks: 2,
+  maxBacks: 2,
+  /** Longest wait for the page to change after a sign-in or create button. */
+  pressWaitMs: 15_000,
+  /** Longest wait for the mailbox command to find the site's mail. */
+  mailWaitMs: 200_000,
+  /** Hosts that serve many companies, the company named first in the path: an account each. */
+  pathTenantHosts: /^(inrecruiting|zinrec)\.intervieweb\.it$|^recruiting\d*\.ultipro\.com$|^careers-page\.com$|^jobs\.jobvite\.com$/,
+  /** Besides the wall's own site, the hosts a mailed account link may open (ATS hosts that mail links from another domain). */
+  mailLinkHosts: ["myworkdayjobs.com", "myworkdaysite.com", "myworkday.com", "successfactors.eu", "successfactors.com", "sapsf.eu", "sapsf.com", "icims.com", "taleo.net"],
 } as const;
 
 /**
@@ -377,7 +398,25 @@ export const RUN = {
   /** How many times a form is opened and filled when values did not land. The second go comes when the other forms are done, with the window to itself. */
   fillAttempts: 1, // was 2: a second go re-opened the whole form and repeated the same misses (owner, 2026-10-03)
   /** Longest one form may take to open and fill. A page that never settles is recorded as blocked instead of holding up the run. */
-  fillTimeoutMs: 180_000,
+  fillTimeoutMs: 480_000, // was 180 s: an account wall waits up to 200 s for the site's mail
+  /**
+   * Longest one job may take from opening its form to the end of Submit, the writer, the form's pages and an emailed
+   * code included. A job past it is recorded for the person and its tab closed, so a stuck form never holds the queue.
+   */
+  jobTimeoutMs: 600_000,
+  /**
+   * The ATS sites an Apply link may lead to from another site. Any other site the link leads to is not followed: the
+   * job is recorded for the person instead, so the runner never wanders off to a job board, a sign-in or a home page.
+   */
+  atsDomains: [
+    "greenhouse.io", "lever.co", "ashbyhq.com", "myworkdayjobs.com", "myworkdaysite.com", "workday.com", "smartrecruiters.com",
+    "workable.com", "teamtailor.com", "recruitee.com", "personio.de", "personio.com", "breezy.hr", "intervieweb.it",
+    "inrecruiting.com", "successfactors.com", "successfactors.eu", "sapsf.com", "sapsf.eu", "jobs.sap.com", "csod.com",
+    "careers-page.com", "manatal.com", "factorialhr.com", "pinpointhq.com", "talentlyft.com", "join.com", "hibob.com",
+    "gem.com", "jobvite.com", "icims.com", "ultipro.com", "ukg.com", "dvinci.de", "dvinci-hr.com", "taleo.net",
+    "oraclecloud.com", "rippling.com", "bamboohr.com", "eightfold.ai", "avature.net", "homerun.co", "comeet.com",
+    "comeet.co", "jobylon.com", "teamdash.com", "dayforcehcm.com",
+  ],
   /** Forms handed to the writer at once. */
   writerConcurrency: 3,
   hostGapMs: 1_000,

@@ -138,6 +138,11 @@ export class Page {
       if (m.error) p.reject(new Error(m.error.message));
       else p.resolve(m.result);
     };
+    // A tab closed under a call (a job stopped for taking too long) ends the call with an error instead of leaving it waiting.
+    ws.onclose = () => {
+      for (const p of page.pending.values()) p.reject(new Error("the tab was closed"));
+      page.pending.clear();
+    };
     await page.send("Page.enable");
     // A click that lands on an upload button must never open the computer's file picker. Files reach a
     // form only through setFiles, and only the ones the plan names (the resume, the cover letter).
@@ -237,12 +242,27 @@ export class Page {
   }
 
   /** Calls one of the helpers that pageHelpers.js installs on the page. */
-  awj<T>(method: string, ...args: unknown[]): Promise<T> {
-    return this.call<T>("function (method, ...args) { return window.__awj[method](...args); }", method, ...args);
+  async awj<T>(method: string, ...args: unknown[]): Promise<T> {
+    // A page that reloaded by itself (dvinci after an upload) has lost the helpers: they are put back once and the call made again.
+    if (Page.reinstall && !(await this.evaluate<boolean>("!!window.__awj"))) await Page.reinstall(this);
+    const run = () => this.call<T>("function (method, ...args) { return window.__awj[method](...args); }", method, ...args);
+    try {
+      return await run();
+    } catch (err) {
+      // The page reloaded between the check and the call: wait for it, put the helpers back, call once more.
+      if (!Page.reinstall || !/reading '|Cannot find context|Execution context was destroyed/.test(err instanceof Error ? err.message : String(err))) throw err;
+      await sleep(1500);
+      await Page.reinstall(this);
+      return run();
+    }
   }
+  /** Puts the page helpers back on a page; set by session.ts, which holds the helper script. */
+  static reinstall: ((page: Page) => Promise<void>) | null = null;
 
-  async navigate(url: string): Promise<void> {
-    await this.send("Page.navigate", { url });
+  /** Opens a URL in this tab. With a referrer, as a click on a link of that page would: some careers sites send a
+   * visitor who arrives with none back to their home page (SuccessFactors' talentcommunity/apply). */
+  async navigate(url: string, referrer?: string): Promise<void> {
+    await this.send("Page.navigate", referrer ? { url, referrer } : { url });
   }
 
   async bringToFront(): Promise<void> {

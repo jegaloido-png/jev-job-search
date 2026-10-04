@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BROWSER, PATHS } from "../config.js";
 import { FieldsDump } from "../forms/fields.js";
-import { closeTab, listTargets, Page, sleep } from "./cdp.js";
+import { closeTab, listTargets, newTab, Page, sleep } from "./cdp.js";
 
 export const script = (name: string) => readFileSync(path.join(PATHS.browserScripts, name), "utf8");
 const SESSION = path.join(PATHS.runs, "browser-session.json");
@@ -34,6 +34,7 @@ export const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
 export async function install(page: Page): Promise<void> {
   await page.evaluate(script("pageHelpers.js"));
 }
+Page.reinstall = install;
 
 /** Waits until the document is loaded and its form controls stop changing. A page with no controls yet gets longer: single-page forms render late. */
 export async function settle(page: Page): Promise<void> {
@@ -63,8 +64,8 @@ export async function dump(page: Page): Promise<FieldsDump> {
   return FieldsDump.parse(JSON.parse(await page.evaluate<string>(script("dumpFields.js"))));
 }
 
-export async function goto(page: Page, url: string): Promise<void> {
-  await page.navigate(url);
+export async function goto(page: Page, url: string, referrer?: string): Promise<void> {
+  await page.navigate(url, referrer);
   await settle(page);
   await install(page);
 }
@@ -120,4 +121,42 @@ export async function closeJobTab(jobId: string): Promise<void> {
   const session = loadSession();
   delete session[jobId];
   saveSession(session);
+}
+
+/**
+ * Closes every tab of the runner's window that belongs to no job: a page a site opened by itself (a privacy policy,
+ * a pop-up), or one left by a run that stopped halfway. One blank tab stays, so the window stays open. Jobs that
+ * no longer have a tab are dropped from the session. Returns how many tabs were closed.
+ */
+export async function closeStrayTabs(): Promise<number> {
+  const targets = (await listTargets()) ?? [];
+  const session = loadSession();
+  const open = new Set(targets.map((t) => t.id));
+  for (const [id, s] of Object.entries(session)) if (!open.has(s.targetId)) delete session[id];
+  saveSession(session);
+  const jobs = new Set(Object.values(session).map((s) => s.targetId));
+  const blank = targets.filter((t) => t.url === "about:blank" && !jobs.has(t.id));
+  // With no blank tab and no job left, closing the rest would close the window: a blank one is opened first.
+  const keep = blank[0]?.id ?? (jobs.size ? undefined : (await inTurn(() => newTab("about:blank"))).id);
+  const stray = targets.filter((t) => !jobs.has(t.id) && t.id !== keep);
+  for (const t of stray) await inTurn(() => closeTab(t.id));
+  return stray.length;
+}
+
+/**
+ * Where to click a form's own button. Its selector can stop naming it once the page has redrawn around it (Workday: a
+ * path of positions), so a button with the same words that the page shows now is taken instead.
+ */
+export async function buttonPoint(page: Page, b: { selector: string; text: string }): Promise<Point> {
+  const p = await page.awj<Point>("point", b.selector);
+  if (p.ok || !b.text) return p;
+  const now = await dump(page);
+  for (const s of now.submitSelectors) {
+    const selector = s.split("  /*")[0] ?? s;
+    const text = /\/\*\s*(.*?)\s*\*\//.exec(s)?.[1] ?? "";
+    if (text.toLowerCase() !== b.text.toLowerCase()) continue;
+    const again = await page.awj<Point>("point", selector);
+    if (again.ok) return again;
+  }
+  return p;
 }

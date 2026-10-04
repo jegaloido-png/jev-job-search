@@ -120,6 +120,9 @@
   const optionEls = (sel) => {
     const el = q(sel);
     if (!el) return [];
+    // Workday's prompt draws its open list elsewhere in the page; its rows carry the prompt's id.
+    const wd = el.getAttribute("data-uxi-multiselect-id");
+    if (wd) return deepAll("[data-automation-id=activeListContainer] [role=option]").filter((o) => visible(o) && o.querySelector(`[data-uxi-multiselect-id="${CSS.escape(wd)}"]`));
     let root = listRootOf(el);
     if (!root) {
       const wrap = el.closest('[class*="container"], [class*="select"], [class*="field"], [class*="question"]');
@@ -244,7 +247,7 @@
       const el = q(sel);
       if (!el) return "missing";
       // A box drawn by its label counts as there when the label is.
-      const label = (el.type === "radio" || el.type === "checkbox") && (el.closest("label") || (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)) || el.closest("[role=checkbox]"));
+      const label = (el.type === "radio" || el.type === "checkbox") && (el.closest("label") || (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)) || el.closest("[role=checkbox]") || (el.getAttribute("aria-labelledby") && document.getElementById(el.getAttribute("aria-labelledby").split(/\s+/)[0])));
       // A select drawn by select2 counts as there when the box beside it is.
       const select2 = el.tagName === "SELECT" && /select2-hidden/.test(el.className) && el.nextElementSibling;
       return !el.disabled && (el.type === "file" || visible(el) || visible(control(el)) || (label && visible(label)) || (select2 && visible(select2))) ? "on" : "off";
@@ -360,6 +363,9 @@
     shown(sel) {
       const el = q(sel);
       if (!el) return "";
+      // A date drawn as one box per part: the parts in order, once every part holds a value.
+      const spins = el.getAttribute("role") === "group" ? [...el.querySelectorAll("input[role=spinbutton]")] : [];
+      if (spins.length >= 2) return spins.every((s) => s.value) ? spins.map((s) => s.value).join("/") : "";
       if (el.type === "checkbox" || el.type === "radio") {
         if (el.type === "radio" && el.name) {
           const on = [...document.querySelectorAll(`input[type=radio][name="${attr(el.name)}"]`)].find((r) => r.checked);
@@ -383,6 +389,14 @@
         // A button group: the pressed button's text.
         const on = withSlotted(el, "button, [role=radio], [role=option]").find((b) => b.getAttribute("aria-pressed") === "true" || b.getAttribute("aria-checked") === "true" || /selected|active|checked/i.test(b.className) || b.dataset.state === "on" || b.dataset.state === "checked");
         return on ? text(on) : "";
+      }
+      // Workday's prompt keeps its picks as items beside a search box that stays empty.
+      if (el.getAttribute("data-uxi-widget-type") === "selectinput") {
+        const box = el.closest("[data-automation-id=multiSelectContainer]");
+        const picks = box ? [...box.querySelectorAll("[data-automation-id=selectedItem]")].map(text).filter(Boolean).join(", ") : el.value || "";
+        // A pick made inside a row of the list ("Corporate Website" > "Company Website") is shown with that row.
+        const under = el.getAttribute("data-awj-under");
+        return picks && under ? `${under} > ${picks}` : picks;
       }
       if (el.getAttribute("role") === "combobox" || el.getAttribute("aria-autocomplete") === "list") {
         const a = adapter(el);
@@ -459,8 +473,18 @@
     // The button is pressed at upload time (openFileButton), and the file box it brings up is marked (pickFileBox).
     exposeFileButtons() {
       let made = 0;
+      // A button named only by aria-labelledby (SuccessFactors: a "+" whose name is "* CV Upload a Resume Opens a dialog").
+      const nameOf = (b) => {
+        const by = (b.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((id) => document.getElementById(id)).filter(Boolean).map(text).join(" ");
+        return (text(b) || b.getAttribute("aria-label") || by || "").replace(/\s+/g, " ").trim();
+      };
+      const PLAIN = /^(aggiungi file|carica file|allega file|add file|upload file|choose file|select file|datei hinzuf(ü|u)gen|ajouter un fichier)$/i;
+      const NAMED = /\b(upload|attach|add|carica|allega|aggiungi|hochladen|anhängen|hinzufügen|télécharger|joindre|ajouter|subir|adjuntar|añadir)\b.{0,20}\b(a |an |un |una |il |la |einen? |le )?(resume|résumé|cv|curriculum|cover letter|lettera( di presentazione)?|document|documento|lebenslauf|anschreiben|dokument|lettre( de motivation)?|carta( de presentación)?)\b/i;
       for (const b of document.querySelectorAll("button, [role=button]")) {
-        if (!visible(b) || !/^(aggiungi file|carica file|allega file|add file|upload file|choose file|select file|datei hinzuf(ü|u)gen|ajouter un fichier)$/i.test(text(b))) continue;
+        if (b.hasAttribute("data-awj-proxy-button") || !visible(b)) continue;
+        const name = nameOf(b);
+        const plain = PLAIN.test(text(b));
+        if (!plain && !(NAMED.test(name) && !/dropbox|google|onedrive|linkedin|indeed|download|scarica|delete|remove|elimina|rimuovi/i.test(name))) continue;
         const box = b.closest("div, section, fieldset");
         if (!box || box.querySelector("input[type=file]")) continue;
         const n = String(document.querySelectorAll("[data-awj-proxy]").length);
@@ -468,6 +492,10 @@
         proxy.type = "file";
         proxy.style.display = "none";
         proxy.setAttribute("data-awj-proxy", n);
+        if (!plain) {
+          proxy.setAttribute("aria-label", name.replace(/\s*(opens a dialog|apre una finestra( di dialogo)?)\s*$/i, ""));
+          if (/^\s*[*✱]|\b(required|obbligatorio|erforderlich|requis|obligatorio)\b/i.test(name + " " + text(box))) proxy.setAttribute("data-awj-required", "1"); // not `required`: an empty stand-in would stop the form's own submit
+        }
         b.setAttribute("data-awj-proxy-button", n);
         b.parentElement.appendChild(proxy);
         made++;
@@ -529,7 +557,7 @@
       if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     },
     errors() {
-      return deepAll('[aria-invalid="true"], [class*="error" i]').filter(visible).map(text).filter((t) => t && t.length < 200).slice(0, 20);
+      return deepAll('[aria-invalid="true"], [class*="error" i], [data-automation-id*="error" i]').filter(visible).map(text).filter((t) => t && t.length < 200).slice(0, 20);
     },
     pageText() {
       if (!document.body) return "";
@@ -634,6 +662,106 @@
       found.forEach((el, i) => el.setAttribute("data-awj-code", String(i)));
       return found.length;
     },
+    /**
+     * The boxes of a sign-in or create-account page: every shown password box, marked data-awj-pw=<n>, and the box for
+     * the email or user name, marked data-awj-user (looked for in the password box's own form first). A robot trap
+     * ("This input is for robots only") is never taken. Returns how many password boxes there are and what the user box holds.
+     */
+    accountBoxes() {
+      deepAll("[data-awj-pw], [data-awj-user]").forEach((el) => {
+        el.removeAttribute("data-awj-pw");
+        el.removeAttribute("data-awj-user");
+      });
+      const pws = deepAll("input[type=password]").filter((el) => visible(el) && !el.disabled);
+      pws.forEach((el, i) => el.setAttribute("data-awj-pw", String(i)));
+      const words = (el) => [el.name, el.id, el.placeholder, el.getAttribute("aria-label"), el.getAttribute("autocomplete"), el.getAttribute("data-automation-id"), ...(el.labels ? [...el.labels].map((l) => text(l)) : [])].filter(Boolean).join(" ");
+      const typed = "input:not([type=hidden]):not([type=password]):not([type=checkbox]):not([type=radio]):not([type=file]):not([type=submit]):not([type=button])";
+      const isUser = (el) => visible(el) && !el.disabled && !/robot|beecatcher|honeypot/i.test(words(el)) && (el.type === "email" || /e-?mail|user|login|utente|benutzer|courriel|correo/i.test(words(el)));
+      const form = pws[0] && pws[0].closest("form");
+      const user = (form && deepAll(typed, form).find(isUser)) || deepAll(typed).find(isUser);
+      if (user) user.setAttribute("data-awj-user", "1");
+      return { passwords: pws.length, user: !!user, userValue: user ? user.value : "" };
+    },
+    /**
+     * A button or link near the sign-in boxes whose words match: the nearest one around the password box (or the email
+     * box), so a page header's own "Sign In" is never taken for the form's. The whole page when none is near.
+     */
+    nearButton(pattern) {
+      const re = new RegExp(pattern, "i");
+      const anchor = deepAll("input[type=password]").find(visible) || q("[data-awj-user]") || deepAll("input[type=email]").find(visible);
+      const words = (x) => (text(x) || x.value || x.getAttribute("aria-label") || "").trim();
+      const pool = (root) => deepAll("a, button, [role=button], input[type=submit], input[type=button]", root).filter((x) => visible(x) && re.test(words(x)));
+      const found = (hit) => {
+        const a = hit.closest("a[href]");
+        const href = a && /^https?:/.test(a.href) && a.href.split("#")[0] !== location.href.split("#")[0] ? a.href : undefined;
+        return { ...center(hit), ok: true, words: words(hit).slice(0, 60), href };
+      };
+      for (let box = anchor, i = 0; box && i < 12; i++) {
+        box = up(box);
+        if (!box) break;
+        const hit = pool(box)[0];
+        if (hit) return found(hit);
+      }
+      const hit = pool(document)[0];
+      return hit ? found(hit) : { x: 0, y: 0, ok: false };
+    },
+    /**
+     * A date drawn as one box per part (Workday: MM / DD / YYYY spin buttons): each part, "m", "d" or "y", in order, and
+     * where to click it. Empty for anything else.
+     */
+    spinParts(sel) {
+      const g = q(sel);
+      if (!g) return [];
+      return [...g.querySelectorAll("input[role=spinbutton]")].map((s) => {
+        const w = `${s.getAttribute("aria-label") || ""} ${s.getAttribute("data-automation-id") || ""}`.toLowerCase();
+        const part = /month|mese|monat|mois|mes\b/.test(w) ? "m" : /day|giorno|tag|jour|d[ií]a/.test(w) ? "d" : /year|anno|jahr|ann[ée]e|a[ñn]o/.test(w) ? "y" : "";
+        return { part, ...center(visible(s) ? s : s.parentElement) };
+      });
+    },
+    /** The picks a Workday prompt holds, each with where to click its remove mark. */
+    promptPicks(sel) {
+      const el = q(sel);
+      const box = el && el.closest("[data-automation-id=multiSelectContainer]");
+      if (!box) return [];
+      return [...box.querySelectorAll("[data-automation-id=selectedItem]")].map((p) => {
+        const x = p.querySelector("[data-automation-id=DELETE_charm]");
+        return { label: text(p), ...(x && visible(x) ? center(x) : { x: 0, y: 0, ok: false }) };
+      });
+    },
+    /** A control that opens the privacy terms in a dialog (SuccessFactors' #dataPrivacyId): where to click it. */
+    privacyOpener() {
+      const re = /privacy|personal data|data (protection|processing)|dati personali|trattamento|informativa|datenschutz|données personnelles|datos personales/i;
+      const el = deepAll("#dataPrivacyId, a[aria-haspopup=dialog], button[aria-haspopup=dialog], [role=button][aria-haspopup=dialog]").find((x) => visible(x) && re.test(`${text(x)} ${x.getAttribute("aria-label") || ""}`));
+      if (!el) return { x: 0, y: 0, ok: false };
+      // A link that wraps over two lines has its middle between them: the click goes on its first line of words.
+      el.scrollIntoView({ block: "center", behavior: "instant" });
+      const r = el.getClientRects()[0] || el.getBoundingClientRect();
+      return { x: r.left + Math.min(20, r.width / 2), y: r.top + r.height / 2, ok: r.width > 0 && r.height > 0 };
+    },
+    /** The size an open list says it has (aria-setsize on its rows), 0 when it says nothing. */
+    listSize(sel) {
+      return Math.max(0, ...optionEls(sel).map((r) => Number(r.getAttribute("aria-setsize")) || 0));
+    },
+    /** Scrolls an open list that draws only the rows in view one view further down. False when it is at its end. */
+    scrollList(sel) {
+      let box = optionEls(sel)[0];
+      while (box && !(box.scrollHeight > box.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(box).overflowY))) box = box.parentElement;
+      if (!box) return false;
+      const was = box.scrollTop;
+      box.scrollTop = was + Math.max(40, box.clientHeight - 40);
+      return box.scrollTop > was;
+    },
+    /** True when the open list draws only some of its rows (Workday's: each row names the list's size in aria-setsize). */
+    listIsPartial(sel) {
+      const rows = optionEls(sel);
+      const size = Math.max(0, ...rows.map((r) => Number(r.getAttribute("aria-setsize")) || 0));
+      return size > rows.length;
+    },
+    /** True for Workday's prompt: a search box whose picks are items beside it. */
+    isPrompt(sel) {
+      const el = q(sel);
+      return !!el && el.getAttribute("data-uxi-widget-type") === "selectinput";
+    },
     /** How many fields a person could type into or pick from are shown now. */
     shownControls() {
       return deepAll("input:not([type=hidden]), select, textarea").filter(visible).length;
@@ -659,16 +787,34 @@
       el.click();
       return true;
     },
-    clickByText(pattern) {
+    clickByText(pattern, opts) {
       const re = new RegExp(pattern, "i");
       // A button drawn by a web component shows the words slotted into its host, not its own.
       const words = (x) => text(x) || (x.getRootNode() instanceof ShadowRoot ? text(x.getRootNode().host) : "");
-      const b = deepAll("a, button, [role=button]").find((x) => visible(x) && re.test(words(x)));
+      const hits = deepAll("a, button, [role=button]").filter((x) => visible(x) && re.test(words(x)));
+      // For the step that opens a form: a button in the page's own content before one in its header or menu (a careers
+      // site's "APPLY" menu), and one not pressed yet before one already pressed (a button that only opens a list of
+      // ways to apply, whose "Apply Now" comes next).
+      const rank = (x) => (x.closest("header, nav, [role=navigation], [role=banner]") ? 1 : 0) + (x.hasAttribute("data-awj-pressed") ? 2 : 0);
+      const b = opts && opts.content ? hits.slice().sort((a, c) => rank(a) - rank(c))[0] : hits[0];
       if (!b) return { x: 0, y: 0, ok: false };
+      if (opts && opts.content) {
+        deepAll("[data-awj-cand]").forEach((x) => x.removeAttribute("data-awj-cand"));
+        b.setAttribute("data-awj-cand", "1");
+      }
       // Where the button leads, when it is a plain link to another page.
       const a = b.closest("a[href]");
       const href = a && /^https?:/.test(a.href) && a.href.split("#")[0] !== location.href.split("#")[0] ? a.href : undefined;
-      return { ...center(b), href };
+      const at = center(b);
+      // Whether a click there reaches the button: a loading layer or a dialog drawn over the page takes it otherwise.
+      const top = at.ok ? (b.getRootNode().elementFromPoint ? b.getRootNode() : document).elementFromPoint(at.x, at.y) : null;
+      const clear = !!top && (top === b || b.contains(top) || top.contains(b));
+      return { ...at, href, clear };
+    },
+    /** Marks the button the last content-first clickByText found as pressed, once the runner has clicked it. */
+    markPressed() {
+      deepAll("[data-awj-cand]").forEach((x) => { x.removeAttribute("data-awj-cand"); x.setAttribute("data-awj-pressed", "1"); });
+      return true;
     },
   };
   return "ok";

@@ -20,7 +20,14 @@
       if (!el) { report.failed.push({ selector: f.selector, why: "not found" }); continue; }
       el.scrollIntoView({ block: "center" });
       if (f.kind === "select") {
-        const opt = [...el.options].find((o) => o.value === f.value) || [...el.options].find((o) => norm(o.text) === norm(f.value)) || [...el.options].find((o) => norm(o.text).includes(norm(f.value)));
+        let opt = [...el.options].find((o) => o.value === f.value) || [...el.options].find((o) => norm(o.text) === norm(f.value)) || [...el.options].find((o) => norm(o.text).includes(norm(f.value)));
+        // A one-word name in the list's own language ("Italy" in a list that says "Italia"): the one option that starts
+        // with the same first four letters.
+        if (!opt && /^[a-z]{5,}$/i.test(f.value.trim())) {
+          const head = norm(f.value).slice(0, 4);
+          const same = [...el.options].filter((o) => norm(o.text).startsWith(head));
+          if (same.length === 1) opt = same[0];
+        }
         if (!opt) { report.failed.push({ selector: f.selector, why: "option not found: " + f.value }); continue; }
         setNative(el, opt.value);
         fire(el, ["input", "change"]);
@@ -43,6 +50,9 @@
         let target = [...group].find((r) => labelOf(r) === norm(f.value));
         if (!target) target = [...group].find((r) => labelOf(r).includes(norm(f.value)));
         if (!target) target = [...group].find((r) => r.value === f.value && r.value !== "on");
+        // A radio that names its choice in its aria-label or in the <label> after its wrapper (the dump reads it there too).
+        const named = (r) => { const n = (r.parentElement && r.parentElement.nextElementSibling) || r.nextElementSibling; return norm(r.getAttribute("aria-label") || (n && n.tagName === "LABEL" ? n.textContent : "")); };
+        if (!target) target = [...group].find((r) => named(r) === norm(f.value));
         if (!target) { report.failed.push({ selector: f.selector, why: "radio option not found: " + f.value }); continue; }
         target.click();
         // A box that did not take the click is tried through its label. It is never ticked from script behind the

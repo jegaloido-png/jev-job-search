@@ -170,13 +170,15 @@ describe("isApplicationForm", () => {
   it("tells an application from a page that merely has inputs", () => {
     expect(isApplicationForm(dumpOf([field({ kind: "select", label: "region" }), field({ kind: "select", label: "region" }), field({ label: "Search" })]))).toBe(false);
     expect(isApplicationForm(dumpOf([field({ label: "First Name" }), field({ kind: "email", label: "Email" })]))).toBe(true);
-    expect(isApplicationForm(dumpOf([field({ kind: "file", label: "Attach" })]))).toBe(true);
+    // A file box alone is not a form (a CV drop zone above a posting's Apply button); with a Submit it is.
+    expect(isApplicationForm(dumpOf([field({ kind: "file", label: "Attach" })]))).toBe(false);
+    expect(isApplicationForm(FieldsDump.parse({ url: "https://x", fields: [field({ kind: "file", label: "Attach" })], submitSelectors: ["button  /* Submit */"] }))).toBe(true);
     expect(isApplicationForm(dumpOf([]))).toBe(false);
   });
   it("does not take a job alert or a newsletter box for an application", () => {
     expect(isApplicationForm(dumpOf([field({ kind: "email", label: "Email me jobs like this" })]))).toBe(false);
     expect(isApplicationForm(dumpOf([field({ label: "First name" }), field({ kind: "email", label: "Email" })]))).toBe(true);
-    expect(isApplicationForm(dumpOf([field({ kind: "file", label: "Resume/CV (Attach)" })]))).toBe(true);
+    expect(isApplicationForm(dumpOf([field({ kind: "file", label: "Resume/CV (Attach)" }), field({ kind: "email", label: "Email" })]))).toBe(true);
   });
 });
 

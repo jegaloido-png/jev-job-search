@@ -319,7 +319,17 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
   for (let i = 0; i < askable.length; i += FORM.fieldsPerCall) {
     const chunk = askable.slice(i, i + FORM.fieldsPerCall);
     const answers = await ask(chunk);
-    for (const f of chunk) planned.push(planField(f, answers[f.id], profile, job));
+    // An optional field JEV is unsure of is left blank, not handed to the writer: a guess there only risks a wrong fact
+    // ("Agricultural Economics" for "Economia"), and an empty optional box never stops a form.
+    for (const f of chunk) {
+      const p = planField(f, answers[f.id], profile, job);
+      // The job the candidate still holds has no end date: the form drops that box once "I currently work here" is ticked.
+      if (p.key === "experience_end_date" && p.action !== "fill" && (profile.experience[0]?.current ?? false)) {
+        planned.push({ ...p, action: "skip", value: null, note: "the candidate still works there" });
+        continue;
+      }
+      planned.push(p.action === "review" && !p.required ? { ...p, action: "skip", value: null, note: `optional, left blank (${p.note ?? "unsure"})` } : p);
+    }
   }
   const fileBoxes = dump.fields.filter((f) => f.kind === "file");
   const wants = fileBoxes.map(fileBoxWants);
@@ -383,6 +393,11 @@ export function planField(f: DumpedField, answer: Answer | undefined, profile: P
   if (f.kind === "checkbox" && CURRENT_JOB.test(f.label)) {
     const now = profile.experience[0]?.current ?? false;
     return now ? { ...base, action: "fill", key: "experience_current", value: "true", confidence: 1, note: null } : { ...base, action: "skip", key: "experience_current", value: null, confidence: 1, note: "left unchecked" };
+  }
+  // "I have a preferred name" opens boxes for another name: ticked only when the profile holds one.
+  if (f.kind === "checkbox" && /preferred name|nome preferito|bevorzugter name|nom d'usage|nombre preferido/i.test(f.label)) {
+    const other = !!profile.name.preferred && profile.name.preferred !== profile.name.first;
+    return other ? { ...base, action: "fill", key: "preferred_name", value: "true", confidence: 1, note: null } : { ...base, action: "skip", key: "preferred_name", value: null, confidence: 1, note: "no other name in the profile" };
   }
   if (f.kind === "checkbox" && CURRENT_STUDY.test(f.label)) {
     const now = profile.education[0]?.status === "in_progress";
@@ -524,6 +539,8 @@ export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "s
   // The box's own question decides first. One box that asks for the resume and the cover letter together
   // (Cornerstone: "Please upload your resume and cover letter") gets the resume, which no application goes without.
   const RESUME = /resume|résumé|\bcv\b|curriculum|lebenslauf/i;
+  // A transcript box never gets the resume, even when it names the resume ("your transcript (not your resume)").
+  if (/transcript/i.test(f.label)) return /\b(graduate|master|phd|doctoral)\b/i.test(f.label) && !/undergraduate/i.test(f.label) ? "graduate_transcript" : "transcript";
   if (COVER_LABEL.test(f.label) && !RESUME.test(f.label)) return "cover";
   if (RESUME.test(f.label) && !COVER_LABEL.test(f.label)) return "resume";
   if (COVER_LABEL.test(text) && !RESUME.test(text)) return "cover";

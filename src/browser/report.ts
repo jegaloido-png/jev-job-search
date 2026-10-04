@@ -120,7 +120,9 @@ export function emptyRequiredFields(d: FieldsDump, plan: FillPlan, shown: string
   const boxes = d.fields.filter((f) => f.kind === "checkbox");
   const groupOf = new Map(boxes.map((f) => [f.selector, f.name && boxes.filter((o) => o.name === f.name).length > 1 ? `name:${f.name}` : f.section ? `question:${f.section}` : ""]));
   const answeredGroups = new Set(plan.fields.filter((f, i) => f.kind === "checkbox" && shown[i]).map((f) => groupOf.get(f.selector)).filter((n): n is string => !!n));
-  return plan.fields.filter((f, i) => f.required && !shown[i] && states[i] !== "off" && f.action !== "upload" && !(f.kind === "checkbox" && answeredGroups.has(groupOf.get(f.selector) ?? "")));
+  // A box the page no longer shows ("missing": the form dropped it, Workday's end date once "I currently work here" is
+  // ticked) is not an empty one. Submit still reads the whole page once more for any required box left empty.
+  return plan.fields.filter((f, i) => f.required && !shown[i] && states[i] === "on" && f.action !== "upload" && !(f.kind === "checkbox" && answeredGroups.has(groupOf.get(f.selector) ?? "")));
 }
 
 export const emptyRequired = (d: FieldsDump, plan: FillPlan, shown: string[], states: ControlState[]) => emptyRequiredFields(d, plan, shown, states).map((f) => f.label);

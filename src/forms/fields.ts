@@ -65,7 +65,7 @@ export type FieldsDump = z.infer<typeof FieldsDump>;
  */
 export function isApplicationForm(d: FieldsDump): boolean {
   const asksFile = d.fields.some((f) => f.kind === "file" || /resume|\bcv\b|curriculum/i.test(f.label));
-  const asksName = d.fields.some((f) => /first name|last name|full name|legal name|^(your )?name\b|prénom|\bnom\b|\bnome\b|cognome|vorname|nachname|nombre|apellido/i.test(f.label));
+  const asksName = d.fields.some((f) => /first name|last name|full name|legal name|given name|family name|surname|^(your )?name\b|prénom|\bnom\b|\bnome\b|cognome|vorname|nachname|nombre|apellido/i.test(f.label));
   const asksEmail = d.fields.some((f) => f.kind === "email" || /e-?mail|courriel/i.test(f.label));
   // A file box alone is not a form: a posting page can carry a CV drop zone above its own Apply button.
   return (asksFile && (d.submitSelectors.length > 0 || asksName || asksEmail)) || (asksName && asksEmail);

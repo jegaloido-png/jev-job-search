@@ -8,10 +8,11 @@ import { promisify } from "node:util";
 import { BROWSER } from "../config.js";
 import { decidePageState, type AfterSubmit, type PageState } from "../forms/pageState.js";
 import type { JevClient } from "../jev/client.js";
+import { openPrivacyNotice } from "./account.js";
 import { sleep, type Page } from "./cdp.js";
 import { emptyRequired, loadPlan, loadReport, pickSubmit } from "./report.js";
 import type { FillPlan } from "../forms/fields.js";
-import { controlStates, dump, inFront, install, pageFor, shownValues, type Point } from "./session.js";
+import { buttonPoint, controlStates, dump, inFront, install, pageFor, shownValues, type Point } from "./session.js";
 
 const run = promisify(exec);
 
@@ -42,11 +43,15 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
     const controlsBefore = await page.evaluate<number>("window.__awj.shownControls()");
     // Signals a board confirms with outside its words (the address, a shown part named for success, the form gone).
     const afterSubmit = async (): Promise<AfterSubmit> => ({ signals: await page.evaluate<string[]>("window.__awj.successSignals()"), controlsBefore, controlsNow: await page.evaluate<number>("window.__awj.shownControls()") });
+    // A privacy statement the site wants opened and accepted in its own dialog (SuccessFactors' "Read and accept the
+    // data privacy statement"), which it opens only once the other fields are valid: it is accepted now. It takes its
+    // own turns at the front of the window, so it comes before the click's turn.
+    await openPrivacyNotice(page, true);
     // Other forms may be filling in their own tabs. The click takes its turn for the front of the window.
     await inFront(page, async () => {
       // A cookie banner still open (one that came up late) is answered before the click, with its most private choice.
       await declineCookieBanner(page);
-      let p = await page.awj<Point>("point", pick.selector);
+      let p = await buttonPoint(page, pick);
       if (!p.ok) throw new Error(`Submit control ${pick.selector} is not on the page.`);
       // A cookie banner over the button would take the click. It is answered with its most private choice
       // (necessary cookies only), never with "accept all". If the button is still covered, it is pressed from script.
@@ -67,19 +72,17 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
     while (Date.now() < deadline) {
       await sleep(BROWSER.pollMs * 3);
       try {
-        await install(page);
-        after = await page.evaluate<string>("window.__awj.pageText()");
+        after = await settledRead(page, "window.__awj.pageText()", after);
       } catch {
         continue; // mid-navigation
       }
       if (after !== before && after.length > 0) break;
     }
     await sleep(BROWSER.pollMs * 6);
-    await install(page);
-    after = await page.evaluate<string>("window.__awj.pageText()");
+    after = await settledRead(page, "window.__awj.pageText()", after);
     const url = await page.evaluate<string>("location.href");
     let state = await decidePageState(jev, after, url, jobId, await afterSubmit());
-    let errors = await page.evaluate<string[]>("window.__awj.errors()");
+    let errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
     // Still the form, and the page reports nothing wrong: the board may only be slow to confirm. Wait for the page to change once more, then look again.
     if (state.state !== "submitted" && !errors.length && !SECURITY_CODE.test(after)) {
       const settled = after;
@@ -87,15 +90,14 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
       while (Date.now() < until && after === settled) {
         await sleep(BROWSER.pollMs * 6);
         try {
-          await install(page);
-          after = await page.evaluate<string>("window.__awj.pageText()");
+          after = await settledRead(page, "window.__awj.pageText()", after);
         } catch {
           continue; // mid-navigation
         }
       }
       if (after !== settled) {
         state = await decidePageState(jev, after, await page.evaluate<string>("location.href"), jobId, await afterSubmit());
-        errors = await page.evaluate<string[]>("window.__awj.errors()");
+        errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
       }
     }
     // The page never changed at all and names no error: the click came before the form was ready to send (Ashby
@@ -109,17 +111,15 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
         while (Date.now() < until && after === before) {
           await sleep(BROWSER.pollMs * 6);
           try {
-            await install(page);
-            after = await page.evaluate<string>("window.__awj.pageText()");
+            after = await settledRead(page, "window.__awj.pageText()", after);
           } catch {
             continue; // mid-navigation
           }
         }
         await sleep(BROWSER.pollMs * 6);
-        await install(page);
-        after = await page.evaluate<string>("window.__awj.pageText()");
+        after = await settledRead(page, "window.__awj.pageText()", after);
         state = await decidePageState(jev, after, await page.evaluate<string>("location.href"), jobId, await afterSubmit());
-        errors = await page.evaluate<string[]>("window.__awj.errors()");
+        errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
       }
     }
     // A board that emails a code: with CODE_COMMAND set, the code is read from the person's mailbox and typed in.
@@ -145,24 +145,41 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
         while (Date.now() < until && after === typed) {
           await sleep(BROWSER.pollMs * 6);
           try {
-            await install(page);
-            after = await page.evaluate<string>("window.__awj.pageText()");
+            after = await settledRead(page, "window.__awj.pageText()", after);
           } catch {
             continue; // mid-navigation
           }
         }
         await sleep(BROWSER.pollMs * 6);
-        await install(page);
-        after = await page.evaluate<string>("window.__awj.pageText()");
+        after = await settledRead(page, "window.__awj.pageText()", after);
         state = await decidePageState(jev, after, await page.evaluate<string>("location.href"), jobId, await afterSubmit());
-        errors = await page.evaluate<string[]>("window.__awj.errors()");
+        errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
       }
     }
+    // A page that says outright that the application went is a confirmation, whatever else it offers under it (Workday
+    // puts "Create Account" under "Your application has successfully been submitted", which read as a sign-in page).
+    if (state.state !== "submitted" && SAYS_SENT.test(after) && !SAYS_SENT.test(before)) state = { ...state, state: "submitted", confidence: Math.max(state.confidence, 0.9) };
     const notSent = state.state !== "submitted";
     return { state: state.state, confidence: state.confidence, url: await page.evaluate<string>("location.href"), errors, needsCode: notSent && SECURITY_CODE.test(after), humanCheck: notSent && !SECURITY_CODE.test(after) && HUMAN_CHECK.test(after), refused: notSent && ALREADY_APPLIED.test(after), excerpt: after.replace(/\s+/g, " ").slice(-400) };
   } finally {
     page.close();
   }
+}
+
+/**
+ * Reads something through the page helpers on a page that may still be loading the next document after a click:
+ * the helpers are put back and the read tried again for a few seconds. Gives the fallback when the page never answers.
+ */
+async function settledRead<T>(page: Page, expression: string, fallback: T): Promise<T> {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await install(page);
+      return await page.evaluate<T>(expression);
+    } catch {
+      await sleep(BROWSER.pollMs * 3);
+    }
+  }
+  return fallback;
 }
 
 /**
@@ -190,7 +207,9 @@ async function mailedCode(command: string, job: { url: string; company: string; 
 
 /** The choice on a cookie banner that allows the least. */
 export const DECLINE_COOKIES =
-  "^\\s*(necessary only|only necessary|necessary cookies only|use necessary cookies only|reject all|reject|decline|decline all|refuse|deny|" +
+  "^\\s*(necessary only|only necessary|necessary cookies only|use necessary cookies only|(agree to|accept) (only )?(the )?necessary( cookies)?|reject all|reject|decline|decline all|refuse|deny|" +
+  "(reject|decline|refuse|deny) all( the)? cookies|rifiuta tutti i cookie|alle cookies ablehnen|refuser tous les cookies|rechazar todas las cookies|" +
+  "disagree( and close)?|continue without agreeing|(rifiuta|non accetto|non accettare) e chiudi|ablehnen und schließen|refuser et fermer|rechazar y cerrar|" +
   "(decline|reject|refuse|deny|rifiuta|nega|ablehnen|refuser|rechazar)\\b.{0,30}\\b(non[- ]?(necessary|essential)|optional|unnecessary|non (necessari|essenziali)|facoltativi|opzionali|nicht notwendige?n?|non essentiels|no necesarias)( cookies?)?|" +
   "rifiuta|rifiuta tutto|rifiuta tutti|rifiuta i cookie|solo necessari|solo cookie necessari|richiesto solo|solo richiesti|solo essenziali|samo nužni|samo nužni kolačići|accetta solo (i )?(cookie )?necessari|continua senza accettare|non accetto|non accettare|nega|" +
   "alle ablehnen|ablehnen|nur notwendige|tout refuser|refuser|continuer sans accepter|rechazar todo|rechazar)\\s*$";
@@ -224,11 +243,15 @@ export async function declineCookieBanner(page: Page): Promise<boolean> {
 /** A board that refuses a second application from the same person for now. The job is skipped, not held. */
 export const ALREADY_APPLIED = /recently applied for another role|unable to accept an additional application|already (applied|submitted an application)/i;
 
+/** Words that say the application went through, in the languages of the boards met so far. */
+export const SAYS_SENT =
+  /your application has (successfully )?been (submitted|received|sent)|application (was|has been) (successfully )?(submitted|received|sent)|successfully (submitted|applied)|thank you for (your application|applying)|(la tua |la sua )?candidatura (è stata )?(inviata|ricevuta|registrata) con successo|grazie per (la tua candidatura|esserti candidat|aver(e)? inviato la (tua )?candidatura)|ihre bewerbung (wurde|ist) (erfolgreich )?(eingereicht|übermittelt|eingegangen)|votre candidature a (bien )?été (envoyée|reçue|transmise)|tu (solicitud|candidatura) (ha sido|se ha) enviad[ao]/i;
+
 /** A page that asks the person to prove they are not a robot (BambooHR after Submit). Only the person can pass it. */
 export const HUMAN_CHECK = /not a robot|i am human|i'm human|captcha|human check/i;
 
-/** A board that emails a code to confirm a person is applying. Only the person can enter it. */
-export const SECURITY_CODE = /verification code was sent|enter the \S+ code|security code/i;
+/** A board that emails a code to confirm a person is applying, in the page's language (Greenhouse writes it in Italian on an Italian posting). */
+export const SECURITY_CODE = /verification code was sent|enter the \S+ code|security code|codice di (verifica|sicurezza)|sicherheitscode|bestätigungscode|code de (vérification|sécurité)|código de (verificación|seguridad)/i;
 
 /**
  * Reads the page a job's tab shows now, without clicking anything. This is how an application is

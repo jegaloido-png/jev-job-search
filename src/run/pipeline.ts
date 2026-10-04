@@ -11,7 +11,8 @@ import path from "node:path";
 import { clearBrowsingData, ensureBrowser } from "../browser/cdp.js";
 import { fillJob, nextPage, resolveJob, shouldAdvance } from "../browser/formRunner.js";
 import { blockedReport, loadReport, type FillReport } from "../browser/report.js";
-import { closeJobTab, loadSession } from "../browser/session.js";
+import { closeJobTab, closeStrayTabs, loadSession } from "../browser/session.js";
+import { ALREADY_EXISTS, markAccountExists } from "../browser/account.js";
 import { submitJob } from "../browser/submit.js";
 import { logNotes } from "../answers/resolve.js";
 import { JevClient } from "../jev/client.js";
@@ -123,10 +124,9 @@ async function fillOnce(jev: JevClient, profile: Profile, e: QueueEntry): Promis
     filling.catch(() => undefined);
     return await Promise.race([filling, tooLong]);
   } catch (err) {
-    if (err instanceof Error && /did not finish loading/.test(err.message)) {
-      abandoned = true;
-      await closeJobTab(e.job.id).catch(() => undefined);
-    }
+    if (err instanceof Error && /did not finish loading/.test(err.message)) abandoned = true;
+    // Whatever stopped the form, its tab goes with it: a run never leaves a page open behind it.
+    await closeJobTab(e.job.id).catch(() => undefined);
     return blockedReport(e.job, err instanceof Error ? err.message : String(err));
   } finally {
     clearTimeout(timer);
@@ -166,6 +166,12 @@ const siteOf = (id: string) => {
   }
 };
 
+/** Jobs whose Submit met "account already exists": each gets one more go, through the site's sign-in. */
+const accountRetried = new Set<string>();
+/** Jobs waiting for that one more go. */
+const accountRetry = (id: string) => accountRetried.has(id) && !accountRetryDone.has(id);
+const accountRetryDone = new Set<string>();
+
 /** Sends one ready form and records what the page became. True when the application went through. */
 export function submitAndRecord(jev: JevClient, id: string, force: boolean, keepOpen = false): Promise<boolean> {
   return perSite(siteOf(id), () =>
@@ -195,6 +201,15 @@ export function submitAndRecord(jev: JevClient, id: string, force: boolean, keep
         if (r.humanCheck) {
           // A robot check is the person's to pass. The tab is closed and the job is listed for them; the run moves on.
           record(id, "needs_review", HUMAN_REASON);
+          if (!keepOpen) await closeJobTab(id);
+          return false;
+        }
+        // A sign-up form that was also the application, refused because the site already holds an account for the
+        // address: the account is marked, and the job is filled once more through the sign-in and a password reset.
+        if (r.errors.some((x) => ALREADY_EXISTS.test(x)) && !accountRetried.has(id)) {
+          markAccountExists(r.url);
+          accountRetried.add(id);
+          console.log("  the site already holds an account for this address: signing in and trying once more");
           if (!keepOpen) await closeJobTab(id);
           return false;
         }
@@ -269,10 +284,39 @@ async function settle(jev: JevClient, r: FillReport, o: RunOptions): Promise<boo
   return outcome.action === "applied";
 }
 
+/**
+ * Runs the rest of one job (the writer, the form's pages, Submit) within RUN.jobTimeoutMs. A job that runs over, or
+ * that throws, is recorded for the person with the reason and its tab is closed, so the queue goes on to the next job.
+ */
+async function withinJobTime(e: QueueEntry, o: RunOptions, work: () => Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const tooLong = new Promise<"late">((done) => {
+    timer = setTimeout(() => done("late"), RUN.jobTimeoutMs);
+  });
+  const running = work();
+  try {
+    if ((await Promise.race([running, tooLong])) !== "late") return;
+    abandoned = true;
+    running.catch(() => undefined);
+    console.log(`${e.job.id}  stopped: the job took over ${RUN.jobTimeoutMs / 60_000} minutes`);
+    if (!o.dry) record(e.job.id, "needs_review", `stopped after ${RUN.jobTimeoutMs / 60_000} minutes: the form never finished`);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    console.log(`${e.job.id}  ${why}`);
+    if (!o.dry) record(e.job.id, "needs_review", `the run stopped on this form: ${why.slice(0, 160)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  await closeJobTab(e.job.id).catch(() => undefined);
+}
+
 export async function pipeline(entries: QueueEntry[], o: RunOptions): Promise<{ reports: FillReport[]; sent: string[] }> {
   const profile = loadProfile();
   const jev = new JevClient();
   await ensureBrowser();
+  // Pages a stopped run left behind are closed before the first form opens.
+  const leftOver = await closeStrayTabs().catch(() => 0);
+  if (leftOver) console.log(`Closed ${leftOver} tab(s) no job owned.`);
   await clearBrowsingWhenDue();
   const writer = limiter(RUN.writerConcurrency);
   const reports = new Array<FillReport>(entries.length);
@@ -296,11 +340,16 @@ export async function pipeline(entries: QueueEntry[], o: RunOptions): Promise<{ 
     prefetch(entries.indexOf(e));
     const first = await fillOnce(jev, profile, e);
     reports[entries.indexOf(e)] = first;
-    const rest = (async () => {
+    const rest = withinJobTime(e, o, async () => {
       const r = o.fillOnly ? first : await writer(() => walk(jev, profile, e, first, o));
       if (RUN.fillAttempts > 1 && worthAnotherGo(r)) again.push(e);
       else await finish(e, r);
-    })().catch((err) => console.log(`${e.job.id}  ${err instanceof Error ? err.message : String(err)}`));
+      if (accountRetry(e.job.id)) {
+        accountRetryDone.add(e.job.id);
+        const second = await fillOnce(jev, profile, e);
+        await finish(e, o.fillOnly ? second : await walk(jev, profile, e, second, o));
+      }
+    }).finally(() => closeStrayTabs().catch(() => 0));
     // One job at a time (RUN.fillConcurrency 1) means each job goes from fill to submit before the next opens. With more
     // tabs, a site that saves every field to its server (Ashby) still gets that, since it drops saves from several forms at
     // once; elsewhere the rest of a job's path does not hold a fill slot and the next form starts filling now.

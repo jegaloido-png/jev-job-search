@@ -103,7 +103,18 @@ export async function readOptions(page: Page, selector: string): Promise<string[
     if (!(await openDropdown(page, selector))) return [];
     // A search typed into the menu on an earlier try would hide most of the list.
     if (await page.awj<boolean>("clearListSearch", selector)) await sleep(BROWSER.pollMs * 2);
-    const seen = await waitOptions(page, selector, false);
+    let seen = await waitOptions(page, selector, false);
+    // A list that draws only the rows in view (Workday's prompts) is read whole by scrolling it, when it is short enough
+    // to show JEV. A longer one is not shown as if its first rows were all: the box is searched instead.
+    if (await page.awj<boolean>("listIsPartial", selector)) {
+      const size = await page.awj<number>("listSize", selector);
+      const all = new Set(seen);
+      for (let i = 0; size <= FORM.maxOptionsSecondLook && all.size < size && i < 40 && (await page.awj<boolean>("scrollList", selector)); i++) {
+        await sleep(BROWSER.pollMs);
+        for (const o of await page.awj<string[]>("options", selector)) all.add(o);
+      }
+      seen = all.size >= size ? [...all] : [];
+    }
     await closeDropdown(page);
     return seen;
   });
@@ -182,6 +193,28 @@ export function fillDropdownByClicking(page: Page, selector: string, value: stri
 }
 
 async function clickAndPick(page: Page, selector: string, value: string, hints: string[]): Promise<string | null> {
+  // A Workday prompt keeps every pick: one that is not the wanted value (left by an earlier try) is removed first.
+  if (await page.awj<boolean>("isPrompt", selector)) {
+    for (let i = 0; i < 6; i++) {
+      const picks = await page.awj<(Point & { label: string })[]>("promptPicks", selector);
+      // A pick holds the value when it names it whole ("Citizen (Italy)" for Italy); the looser page check would take
+      // "Citizen (Italy)" for "Citizen (Nepal)".
+      const holds = (label: string) => norm(label) === norm(value) || norm(label).includes(norm(value));
+      const wrong = picks.find((p) => p.ok && !holds(p.label));
+      if (!wrong) {
+        if (picks.some((p) => holds(p.label))) return null;
+        break;
+      }
+      await page.click(wrong.x, wrong.y);
+      await sleep(BROWSER.pollMs * 3);
+      // Removing a pick opens the list; it is closed so the next click opens it afresh with the keyboard in the box.
+      await closeDropdown(page);
+      await sleep(BROWSER.pollMs * 2);
+    }
+  }
+  // A list that already shows the value keeps it: a committed choice is not picked again.
+  const before = (await shownValues(page, [selector]))[0] ?? "";
+  if (before && showsValue(value, before)) return null;
   if (!(await openDropdown(page, selector))) return "control not found";
   let opts = await waitOptions(page, selector, false);
   if (!opts.length) {
@@ -189,6 +222,11 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
     await openDropdown(page, selector);
     opts = await waitOptions(page, selector, false);
   }
+  // A list of Italian regions and provinces together (Workday: "Puglia" and "Bari"): the province is what the city box
+  // is checked against ("Enter a city that is part of the region you entered"), so the candidate's city wins when it is
+  // a province too. Hints are [city, region, region code, country].
+  const [city, region] = hints;
+  if (city && region && norm(value) === norm(region) && opts.some((o) => norm(o) === norm(city)) && opts.some((o) => norm(o) === norm(region))) value = city;
   let choice = pickOption(opts, value, hints);
   if (!choice) {
     // Search-as-you-type lists. A place is searched by its city; anything else by the full value, then its first word.
@@ -198,8 +236,39 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
       if (!typed) continue;
       // Keys go wherever the focus is. A click that did not put it in this box (the window was still coming to the front) is made good here.
       if (!(await page.awj<boolean>("hasFocus", selector)) && !(await page.awj<boolean>("focus", selector))) break;
+      // A Workday prompt's search box keeps what an earlier try typed: it is emptied first. (Elsewhere a Backspace could
+      // remove a choice already made.)
+      // A text box that is the list's own search box and shows another value (SuccessFactors' picklist shows the
+      // current choice in it) is emptied too, or the search text lands after it.
+      const ownText = await page.call<string>("function (s) { const el = window.__awj.q(s); return el && el.tagName === 'INPUT' && el.type !== 'hidden' ? el.value : ''; }", selector).catch(() => "");
+      if ((await page.awj<boolean>("isPrompt", selector)) || ownText) {
+        await page.awj("selectAll");
+        await page.key("Backspace");
+      }
       await page.type(typed);
       // The first word only widens the search. The pick still has to match the whole value.
+      opts = await waitOptions(page, selector, true, (seen) => pickOption(seen, value, hints) !== null);
+      choice = pickOption(opts, value, hints);
+      if (choice) break;
+      // A list that filters only on key events (SuccessFactors' paginated picklist, 100 rows a page) ignores pasted
+      // text: the same words are typed again key by key.
+      if (!(await page.awj<boolean>("isPrompt", selector))) {
+        for (let i = 0; i < typed.length; i++) await page.key("Backspace");
+        await page.typeKeys(typed);
+        opts = await waitOptions(page, selector, true, (seen) => pickOption(seen, value, hints) !== null);
+        choice = pickOption(opts, value, hints);
+        if (choice) break;
+      }
+      // A list that searches only on Enter (Workday's prompt), and picks a lone match by itself. Elsewhere Enter would
+      // take whatever row is highlighted, so only there.
+      if (!(await page.awj<boolean>("isPrompt", selector))) {
+        for (let i = 0; i < typed.length; i++) await page.key("Backspace");
+        continue;
+      }
+      await page.key("Enter");
+      await sleep(BROWSER.pollMs * 4);
+      const picked = (await shownValues(page, [selector]))[0] ?? "";
+      if (picked && showsValue(value, picked)) return null;
       opts = await waitOptions(page, selector, true, (seen) => pickOption(seen, value, hints) !== null);
       choice = pickOption(opts, value, hints);
       if (choice) break;
@@ -223,9 +292,38 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   }
   await page.click(p.x, p.y);
   await sleep(BROWSER.pollMs);
+  // A row that opens a list of its own (Workday's "How did you hear about us?": "Job Posting Sites" > "LinkedIn"):
+  // nothing is picked yet and other rows are shown. The row that best fits the wanted value is taken there, a few levels deep.
+  const top = choice;
+  for (let depth = 0; depth < 3 && !((await shownValues(page, [selector]))[0] ?? ""); depth++) {
+    const sub = await waitOptions(page, selector, false);
+    if (!sub.length || sub.join("|") === opts.join("|")) break;
+    const next = pickOption(sub, value, hints) ?? subRow(sub, value);
+    const q = next ? await page.awj<Point>("optionPoint", selector, next) : null;
+    if (!next || !q?.ok) break;
+    await page.click(q.x, q.y);
+    await sleep(BROWSER.pollMs * 2);
+    opts = sub;
+    choice = next;
+  }
+  // The pick was made inside the row that was asked for: the box is marked with that row, so reading it back shows
+  // "Corporate Website > Company Website" and the wanted "Corporate Website" is seen to be there.
+  if (choice !== top) await page.call("function (s, under) { const el = window.__awj.q(s); if (el) el.setAttribute('data-awj-under', under); }", selector, top);
   const shown = (await shownValues(page, [selector]))[0] ?? "";
-  if (shown && !showsValue(choice, shown)) return `the list shows "${shown.slice(0, 40)}" after "${choice}" was clicked`;
+  if (shown && !showsValue(choice, shown) && !showsValue(value, shown)) return `the list shows "${shown.slice(0, 40)}" after "${choice}" was clicked`;
+  if (!shown && (await page.awj<boolean>("isPrompt", selector))) return `nothing was picked after "${choice}" was clicked`;
   return null;
+}
+
+/** In a list opened from another row: the row sharing a word with the wanted value, else a general one (a website, "other"), else the first. */
+function subRow(rows: string[], value: string): string | null {
+  const words = norm(value).split(/[^a-z0-9]+/).filter((w) => w.length >= 4);
+  return (
+    rows.find((r) => words.some((w) => norm(r).includes(w))) ??
+    rows.find((r) => /linkedin|website|web site|sito|internet|online|career|carriere|other|altro|altri/i.test(r)) ??
+    rows[0] ??
+    null
+  );
 }
 
 /**
@@ -335,9 +433,45 @@ export function closestOptions(options: string[], wanted: string, limit: number)
 /** Every option a search-as-you-type list offers for the wanted value: its starting list plus a search per word stem. */
 export async function candidateOptions(page: Page, selector: string, wanted: string): Promise<string[]> {
   const found = new Set(await readOptions(page, selector));
+  // A Workday prompt shows only the first rows of a long list and searches on Enter: each telling word of the wanted
+  // value is searched ("Econom" finds Economics for "Economia", "Bari" the university for "Università degli Studi di Bari").
+  if (await page.awj<boolean>("isPrompt", selector)) {
+    const GENERIC = /^(universit|degli|della|studi|studies|school|scuola|istituto|institute|college|politecnico|academy|accademia|the|and|per|with)/;
+    const words = norm(wanted).normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9]+/).filter((w) => w.length >= 4);
+    for (const word of [...words.filter((w) => !GENERIC.test(w)), ...words.filter((w) => GENERIC.test(w))].slice(0, 3)) {
+      for (const o of await promptSearch(page, selector, word.slice(0, 6))) found.add(o);
+    }
+    return [...found];
+  }
   for (const word of norm(wanted).split(/[^a-z0-9]+/).filter((w) => w.length >= 4)) {
     const more = await page.awj<string[] | null>("reactLoad", selector, word.slice(0, 6)).catch(() => null);
     for (const o of more ?? []) found.add(o);
   }
   return [...found];
+}
+
+/** The rows a Workday prompt shows for a search, read without keeping any pick the search made. */
+function promptSearch(page: Page, selector: string, typed: string): Promise<string[]> {
+  return inFront(page, async () => {
+    const before = (await page.awj<{ label: string }[]>("promptPicks", selector)).map((p) => p.label);
+    if (!(await openDropdown(page, selector))) return [];
+    if (!(await page.awj<boolean>("hasFocus", selector)) && !(await page.awj<boolean>("focus", selector))) return [];
+    await page.awj("selectAll");
+    await page.key("Backspace");
+    await page.type(typed);
+    await page.key("Enter");
+    const seen = await waitOptions(page, selector, true);
+    await page.awj("selectAll");
+    await page.key("Backspace");
+    await closeDropdown(page);
+    // Enter picks a lone match by itself; the search was only to read the rows, so such a pick is taken off again.
+    for (const p of await page.awj<(Point & { label: string })[]>("promptPicks", selector)) {
+      if (before.includes(p.label) || !p.ok) continue;
+      await page.click(p.x, p.y);
+      await sleep(BROWSER.pollMs * 3);
+      seen.push(p.label);
+    }
+    await closeDropdown(page);
+    return seen;
+  });
 }

@@ -19,6 +19,8 @@
     if (r.width === 0 || r.height === 0) return false;
     // A box one or two pixels wide is kept for screen readers or validation ("sr-only"), not for typing.
     if (r.width <= 2 && r.height <= 2) return false;
+    // A box pushed off the left of the page is a trap for robots (Breezy's "hp_" field), never a question.
+    if (r.right <= 0) return false;
     // react-select and friends keep a transparent, focus-skipped input around for HTML5 validation.
     if (st.opacity === "0" && el.tabIndex === -1) return false;
     return true;
@@ -93,10 +95,14 @@
   // Ids a UI library numbers on each render (FabricTextField-349, :r1:, radix-12) can change under us, so they are not used to find a field again.
   // An id that merely ends in digits (question_8595663005, school--0) is the form's own and stays put.
   // A run of twelve or more letters and digits in both cases (nNpgf9k9eygQEJqI) is drawn at random on each render.
-  const RENDER_ID = /^(:r|radix-|headlessui-|mui-|react-aria|downshift-|rc_select_|el-id-|Fabric[A-Za-z]*-?\d|field-\d+$|(?=.*\d)(?=.*[a-z])(?=.*[A-Z])[A-Za-z0-9]{12,}$)/;
+  // SuccessFactors numbers its controls per render ("86:_input" becomes "194:_input" once a file is uploaded), as do UI5's
+  // web components ("ui5wc_5-inner").
+  const RENDER_ID = /^(:r|\d+:|ui5wc_\d|radix-|headlessui-|mui-|react-aria|downshift-|rc_select_|el-id-|Fabric[A-Za-z]*-?\d|field-\d+$|(?=.*\d)(?=.*[a-z])(?=.*[A-Z])[A-Za-z0-9]{12,}$)/;
   const stableId = (id, root = document) => !!id && !RENDER_ID.test(id) && unique("#" + cssEscape(id), root);
   // A control inside a shadow root is found through its host: the host's selector, " >>> ", then its own inside the root.
-  const selectorFor = (el) => (inShadow(el) ? selectorFor(rootOf(el).host) + SHADOW + localSelector(el, rootOf(el)) : localSelector(el, document));
+  // A stand-in file box the runner made for an upload button is named by its own mark: a path to it moves as the page
+  // redraws around it.
+  const selectorFor = (el) => el.hasAttribute && el.hasAttribute("data-awj-proxy") && !inShadow(el) ? `[data-awj-proxy="${el.getAttribute("data-awj-proxy")}"]` : (inShadow(el) ?selectorFor(rootOf(el).host) + SHADOW + localSelector(el, rootOf(el)) : localSelector(el, document));
   const localSelector = (el, root) => {
     const tag = el.tagName.toLowerCase();
     // A radio button is one of a group, and the group is what gets set: its name finds it again whatever its id.
@@ -315,8 +321,15 @@
   // A drawn picker keeps the real, required input out of sight in the same box (Workable's comboboxes).
   const hiddenRequiredTwin = (el) => { const box = el.closest("[data-input-type], [data-ui], [class*=field i]"); return !!box && [...box.querySelectorAll("input[required], select[required]")].some((t) => t !== el && !visible(t)); };
   const headingSaysRequired = (el) => { const h = fieldHeading(el); return !!h && (/required/i.test(String(h.className)) || /[*✱]\s*$|^\s*[*✱]/.test(text(h))); };
+  // A box whose class says required. Angular's state classes on the whole form ("ng-valid-required") say nothing about one field.
+  const REQUIRED_CLASS = /^(?!ng-(in)?valid-required$|not-required$|non-required$).*required/i;
+  const requiredClass = (el) => {
+    for (let cur = el; cur && cur.nodeType === 1 && cur.tagName !== "FORM" && cur !== document.body; cur = cur.parentElement)
+      if ([...cur.classList].some((c) => REQUIRED_CLASS.test(c))) return true;
+    return false;
+  };
   // Some boards write the word instead of a star: "Indirizzo Obbligatorio", "Address Required".
-  const isRequired = (el, label) => !/\(optional\)|\(facoltativo\)/i.test(label) && (/(^|\s)(Obbligatorio|Required|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)(\s|\.|$)/.test(label) || /^\s*(obbligatorio|required)\b/i.test(label) || el.required || el.getAttribute("aria-required") === "true" || /[*✱]\s*$|^\s*[*✱]|\(required\)/i.test(label) || /required/i.test(el.closest("[class*=required i]")?.className || "") || hiddenRequiredTwin(el) || headingSaysRequired(el));
+  const isRequired = (el, label) => !/\(optional\)|\(facoltativo\)/i.test(label) && (/(^|\s)(Obbligatorio|Required|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)(\s|\.|$)/.test(label) || /^\s*(obbligatorio|required)\b/i.test(label) || el.required || el.getAttribute("aria-required") === "true" || /[*✱]\s*$|^\s*[*✱]|\(required\)/i.test(label) || requiredClass(el) || hiddenRequiredTwin(el) || headingSaysRequired(el));
 
   // A plain text input with a suggestion list beside it (Lever's location box) only accepts a picked suggestion.
   const hasSuggestBox = (el) => el.tagName === "INPUT" && !!el.parentElement && !!el.parentElement.querySelector('[class*="dropdown-results" i], [class*="autocomplete" i], [class*="typeahead" i], [class*="suggestions" i]');
@@ -371,6 +384,13 @@
     const type = (el.getAttribute("type") || (tag === "input" ? "text" : tag)).toLowerCase();
     if (SKIP_TYPES.has(type) && !el.matches(MENU_BUTTON)) return;
     if (inPanel(el)) return;
+    // One part of a date drawn as boxes per part: the whole date is read as one field below.
+    if (el.getAttribute("role") === "spinbutton" && el.closest("[role=group]") && el.closest("[role=group]").querySelectorAll("input[role=spinbutton]").length >= 2) return;
+    // The site's own header and menus (a language picker, the signed-in account's menu) are not questions of the form.
+    if (el.closest("header, nav, [role=banner], [role=navigation], [data-automation-id=header]") && !el.closest("form")) return;
+    // Workday's prompt: the list of its picks and its open list of rows belong to its search box, not questions of their own.
+    if (el.getAttribute("role") === "listbox" && el.closest("[data-automation-id=multiSelectContainer], [data-automation-id=activeListContainer], [data-automation-id=selectedItemList]")) return;
+    if (el.getAttribute("data-automation-id") === "activeListContainer" || el.closest("[data-automation-id=activeListContainer]")) return;
     const isControl = ["input", "select", "textarea"].includes(tag);
     // The list a combobox opens is that combobox's, not a question of its own.
     if (!isControl && el.id && rootOf(el).querySelector(`[aria-controls="${attr(el.id)}"], [aria-owns="${attr(el.id)}"]`)) return;
@@ -382,7 +402,9 @@
       if (c && !isPanel(el) && (usedContainers.has(c) || [...c.querySelectorAll("input:not([type=hidden]), select, textarea")].some(visible))) return;
     }
     // A radio or a checkbox is often drawn by its label, with the real box kept out of sight behind it.
-    const drawnByLabel = (type === "radio" || type === "checkbox") && !visible(el) && [el.closest("label"), labelsFor(el)[0], type === "checkbox" && el.closest("[role=checkbox]")].some((l) => l && visible(l));
+    // Recruitee names the box's words with aria-labelledby, a div beside the 1 px box.
+    const namedBy = (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((id) => byId(el, id))[0];
+    const drawnByLabel = (type === "radio" || type === "checkbox") && !visible(el) && [el.closest("label"), labelsFor(el)[0], type === "checkbox" && el.closest("[role=checkbox]"), namedBy].some((l) => l && visible(l));
     // A select2 list keeps the real <select> out of sight and draws its own box beside it.
     const drawnBySelect2 = tag === "select" && /select2-hidden/.test(el.className) && !!el.nextElementSibling && visible(el.nextElementSibling);
     if (!visible(el) && type !== "file" && !drawnByLabel && !drawnBySelect2) return;
@@ -402,7 +424,7 @@
     if (isCalendar) kind = "calendar";
     else if (tag === "select") kind = "select";
     else if (tag === "textarea") kind = "textarea";
-    else if (role === "combobox" || el.getAttribute("aria-autocomplete") === "list" || role === "listbox" || hasSuggestBox(el) || el.matches(MENU_BUTTON)) kind = "combobox";
+    else if (role === "combobox" || el.getAttribute("aria-autocomplete") === "list" || role === "listbox" || hasSuggestBox(el) || el.matches(MENU_BUTTON) || el.getAttribute("data-uxi-widget-type") === "selectinput") kind = "combobox";
     else if (type === "radio") kind = "radio";
     else if (type === "checkbox") kind = "checkbox";
     else if (type === "file") kind = "file";
@@ -472,6 +494,14 @@
       }
       const al = (el.getAttribute("aria-label") || "").trim();
       if (!named && al) named = own && al.endsWith(own) ? al.slice(0, -own.length).trim() : al;
+      // A name that is only the placeholder and "Required" (Workday's "Select One Required") says nothing: the question
+      // is the text block above the button.
+      const bare = (t) => t.replace(/(select an option|select one|please select|select|choose|seleziona|scegli)/gi, "").replace(/\b(one|required|obbligatorio|pflichtfeld|obligatoire|obligatorio)\b/gi, "").replace(/[-–—\s*✱]/g, "");
+      if (named && bare(named) === "") {
+        if (/required/i.test(named)) f.required = true;
+        named = questionFor(el) || "";
+      }
+      if (!named && bare(f.label) === "") f.label = questionFor(el) || f.label;
       f.label = (named || f.label).slice(0, LABEL_MAX);
       f.value = shownNow;
       f.required = f.required || isRequired(el, f.label);
@@ -479,7 +509,10 @@
     if (kind !== "radio" && kind !== "checkbox" && kind !== "file") f.label = cleanLabel(el, f.label);
     if (kind === "file") {
       f.label = fileLabel(el, f.label);
-      f.required = f.required || /[*✱]\s*$/.test(fileQuestion(el));
+      // A stand-in box made for an upload button already carries the button's own required mark; the words around it
+      // can hold another box's star (SuccessFactors: "* CV" above "Cover letter").
+      if (el.hasAttribute("data-awj-proxy")) f.required = el.hasAttribute("data-awj-required");
+      else f.required = f.required || /[*✱]\s*$/.test(fileQuestion(el));
     }
 
     if (kind === "radio") {
@@ -489,7 +522,11 @@
       const group = el.name ? rootOf(el).querySelectorAll(`input[type=radio][name="${attr(el.name)}"]`) : [el];
       group.forEach((r) => {
         const l = labelsFor(r)[0] || r.closest("label");
-        f.options.push({ value: r.value, label: text(l) || r.value });
+        // A radio with no <label for> names its choice in its aria-label, or in a <label> right after its own wrapper
+        // (SuccessFactors: "Any company recruiter worldwide").
+        const next = (r.parentElement && r.parentElement.nextElementSibling) || r.nextElementSibling;
+        const after = next && next.tagName === "LABEL" && !next.querySelector("input") ? text(next) : "";
+        f.options.push({ value: r.value, label: text(l) || (r.getAttribute("aria-label") || "").trim() || after || r.value });
         if (r.checked) f.value = r.value;
       });
       const fs = el.closest("fieldset, [role=radiogroup]");
@@ -515,7 +552,11 @@
       f.checked = el.checked;
       f.value = el.value;
     } else if (kind === "combobox") {
-      f.value = el.value || f.value || "";
+      // Workday's prompt keeps its picks as items beside a search box that stays empty.
+      const box = el.getAttribute("data-uxi-widget-type") === "selectinput" && el.closest("[data-automation-id=multiSelectContainer]");
+      const picks = box ? [...box.querySelectorAll("[data-automation-id=selectedItem]")].map(text).filter(Boolean).join(", ") : "";
+      if (box) f.widget = "workday-prompt";
+      f.value = picks || el.value || f.value || "";
       const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
       const list = listId ? byId(el, listId) : null;
       if (list) list.querySelectorAll("[role=option]").forEach((o) => f.options.push({ value: text(o), label: text(o) }));
@@ -546,7 +587,7 @@
     // Skip a container whose control was already read. An input nobody can see (Ashby keeps a hidden checkbox
     // behind its Yes and No buttons) does not count: the buttons are the control.
     if (!drawnRadios && [...c.querySelectorAll("input, select, textarea")].some((x) => x.type !== "hidden" && (dumped.has(x) || visible(x)))) return;
-    const buttons = withSlotted(c, "button, [role=radio], [role=option]").filter((b) => visible(b) && text(b).length > 0 && text(b).length <= 90 && !/upload|browse|remove|submit|apply|next|continue|back|invia|candid|avanti|prosegui|continua|indietro|carica/i.test(text(b)));
+    const buttons = withSlotted(c, "button, [role=radio], [role=option]").filter((b) => visible(b) && !b.matches(MENU_BUTTON) && text(b).length > 0 && text(b).length <= 90 && !/upload|browse|remove|submit|apply|next|continue|back|invia|candid|avanti|prosegui|continua|indietro|carica/i.test(text(b)));
     if (buttons.length < 2 || buttons.length > 12) return;
     if ([...seenGroup].some((prev) => prev.contains(c) || c.contains(prev))) return;
     seenGroup.add(c);
@@ -575,6 +616,35 @@
     });
   });
 
+  // A date drawn as one box per part (Workday's MM / DD / YYYY spin buttons, MM / YYYY for work history): one field for
+  // the whole date, its parts named in order in the placeholder.
+  deepAll("[role=group]").forEach((g) => {
+    const spins = [...g.querySelectorAll("input[role=spinbutton]")];
+    // Only the group that holds the parts itself, not a section around it.
+    if (spins.length < 2 || !visible(g) || g.querySelector(":scope [role=group] input[role=spinbutton]")) return;
+    const box = g.closest("fieldset");
+    const legend = box && box.querySelector("legend");
+    const raw = legend ? text(legend) : questionFor(g) || "";
+    fields.push({
+      id: "f" + i++,
+      widget: "spin-date",
+      selector: groupSelectorFor(g),
+      kind: "date",
+      name: "",
+      label: raw.replace(/\s*[*✱]\s*$/, "").slice(0, LABEL_MAX),
+      hint: "",
+      placeholder: spins.map((s) => s.getAttribute("aria-label") || "").join(" / "),
+      required: /[*✱]\s*$/.test(raw) || spins.some((s) => s.getAttribute("aria-required") === "true"),
+      value: spins.every((s) => s.value) ? spins.map((s) => s.value).join("/") : "",
+      options: [],
+      accept: "",
+      maxLength: null,
+      autocomplete: "",
+      section: sectionFor(g),
+      buttonGroup: false,
+    });
+  });
+
   // The application is the <form> that holds the resume or the email box. A control that sits above
   // that form and outside it (a job-alert box, a site search) is not part of the application.
   // A control in a shadow root is placed by the host that holds it in the page.
@@ -598,7 +668,9 @@
   out.frames = [...document.querySelectorAll("iframe[src]")]
     .filter((f) => bare(f.src) !== bare(location.href) && !(f.offsetWidth === 0 && f.offsetHeight === 0))
     .map((f) => f.src)
-    .filter((src) => /greenhouse|lever\.co|ashbyhq|workday|smartrecruiters|jobvite|bamboohr|rippling|icims/i.test(hostOf(src)));
+    .filter((src) => /greenhouse|lever\.co|ashbyhq|workday|smartrecruiters|jobvite|bamboohr|rippling|icims/i.test(hostOf(src)))
+    // An "Apply with LinkedIn" gadget (Workday's applywithlinkedin.myworkdaygadgets.com) is a sign-in through another site, not the form.
+    .filter((src) => !/linkedin|gadgets?\./i.test(src));
   // A take-home assignment the page asks for, with its link. The application still goes; the assignment is listed for the person.
   const TAKE_HOME = /take[- ]?home|coding (challenge|assessment|exercise)|technical assessment|complete the assignment/i;
   const URL_IN_TEXT = /https?:\/\/[^\s"')<>]+/;

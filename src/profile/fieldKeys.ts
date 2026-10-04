@@ -24,6 +24,8 @@ export const PROFILE_KEYS = {
   phone_country_code: "Phone country code or country selector",
   phone_and_email: "One box that asks for both a phone number and an email address",
   address_line1: "Street address, first line",
+  street_name: "Street name alone, only when the form has a separate box for the house number",
+  street_number: "House or street number alone (Street Number, Numero civico, Hausnummer)",
   city: "City",
   state_province: "State, province or region",
   postal_code: "Postal or ZIP code",
@@ -117,6 +119,8 @@ export function valueFor(profile: Profile, key: ProfileKey): string | null {
     case "phone_country_code": return profile.phone.countryCode;
     case "phone_and_email": return `${profile.phone.countryCode} ${profile.phone.national}, ${profile.email}`;
     case "address_line1": return profile.address.line1;
+    case "street_name": return (/^(.*?)[\s,]+(\d+\s*[a-z]?)$/i.exec(profile.address.line1.trim())?.[1] ?? profile.address.line1).trim();
+    case "street_number": return /^(.*?)[\s,]+(\d+\s*[a-z]?)$/i.exec(profile.address.line1.trim())?.[2]?.trim() ?? null;
     case "city": return profile.address.city;
     case "state_province": return profile.address.region;
     case "postal_code": return profile.address.postalCode;

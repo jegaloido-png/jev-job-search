@@ -90,7 +90,9 @@ export function buildPrompt(entry: QueueEntry | null, filled: { label: string; v
   // Today's date rides with each form, not the system prompt, so remembered answers stay tied to the same candidate.
   // Without it a start date came out in the past ("2025-03-17").
   const today = `${new Date().toISOString().slice(0, 10)} (a start date, or any date still to come, is on or after this day)`;
-  return JSON.stringify({ today, job: jobContext(entry), resume_for_this_job: resumeForJob(entry), already_filled: filled, open_fields: open }, null, 1);
+  // Rides here for the same reason. A work-permit list with no "citizen" choice stopped an Italian candidate in Italy.
+  const work_permit = "A candidate who is a citizen of the job's country, or an EU citizen applying in the EU, may work there with no visa. When a work-permit question offers no citizen choice, pick the one that says the candidate may stay and work there for good (permanent residency, no visa needed). That alone is not a reason for review.";
+  return JSON.stringify({ today, work_permit, job: jobContext(entry), resume_for_this_job: resumeForJob(entry), already_filled: filled, open_fields: open }, null, 1);
 }
 
 /** The text of the resume written for this job, when one was: the writer answers in step with what the company receives. */
@@ -265,9 +267,21 @@ async function callVertex(prompt: string, system: string, meta: { purpose: Write
   return text;
 }
 
+/** Vertex answers 429 ("Resource exhausted") or 503 now and then under load: the call is made again after a pause, twice. */
+async function withRetry(call: () => Promise<string>): Promise<string> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (attempt >= 2 || !/answered (429|500|503)\b/.test(err instanceof Error ? err.message : "")) throw err;
+      await new Promise((r) => setTimeout(r, 15_000 * (attempt + 1)));
+    }
+  }
+}
+
 function callWriter(prompt: string, system: string, meta: { purpose: WriterCall["purpose"]; jobId: string }): Promise<string> {
   if (writerBackend() === "api") return callApi(prompt, system, meta);
-  if (writerBackend() === "vertex") return callVertex(prompt, system, meta);
+  if (writerBackend() === "vertex") return withRetry(() => callVertex(prompt, system, meta));
   return new Promise((resolve, reject) => {
     mkdirSync(WRITER.cwd, { recursive: true });
     const child = spawn(
