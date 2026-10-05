@@ -9,7 +9,7 @@ import type { Method } from "../knowledge/sites.js";
 import type { Profile } from "../profile/schema.js";
 import { sleep, type Page } from "./cdp.js";
 import { pickDate } from "./calendar.js";
-import { isoOf, showsValue, toYmd } from "../util/dates.js";
+import { isoOf, PRESENT, showsValue, toYmd } from "../util/dates.js";
 import { fillDropdown, fillDropdownByClicking, fillPanel } from "./dropdowns.js";
 import type { Failure, Fill } from "./report.js";
 import { controlStates, inFront, norm, script, shownValues, trace, type Point } from "./session.js";
@@ -28,6 +28,17 @@ export const provinceForRegion = (want: string, shown: string, profile?: Profile
   !!profile && want.trim().toLowerCase() === profile.address.region.trim().toLowerCase() && shown.trim().toLowerCase() === profile.address.city.trim().toLowerCase();
 
 export async function applyFills(page: Page, given: Fill[], profile: Profile, guide?: FillGuide): Promise<Failure[]> {
+  // Filling never leaves the page: a "Leave site?" asked meanwhile is answered "stay".
+  const was = page.stayOnPage;
+  page.stayOnPage = true;
+  try {
+    return await fillAll(page, given, profile, guide);
+  } finally {
+    page.stayOnPage = was;
+  }
+}
+
+async function fillAll(page: Page, given: Fill[], profile: Profile, guide?: FillGuide): Promise<Failure[]> {
   // A browser's own date box (type=date) takes only yyyy-mm-dd, whatever it shows: "January 2022" is written as 2022-01-01.
   let fills = given.map((f) => (f.kind === "date" && toYmd(f.value) ? { ...f, value: isoOf(toYmd(f.value)!) } : f));
   const failed: Failure[] = [];
@@ -100,7 +111,7 @@ export async function applyFills(page: Page, given: Fill[], profile: Profile, gu
       const now = norm(await page.awj<string>("shown", f.selector));
       if ([profile.address.postalCode, profile.address.city].some((x) => x && now.includes(norm(x)))) continue;
       // An address panel is searched by the candidate's own postal code, then city, whatever the plan wrote.
-      const why = await fillPanel(page, f.selector, [profile.address.postalCode ?? "", profile.address.city], hints);
+      const why = await fillPanel(page, f.selector, [profile.address.postalCode ?? "", profile.address.city], hints, profile.address.line1);
       if (why) failed.push({ selector: f.selector, why });
       else how.set(f.selector, "clicked");
       panels.add(f.selector);
@@ -108,11 +119,36 @@ export async function applyFills(page: Page, given: Fill[], profile: Profile, gu
       trace(`panel ${f.selector} ${Date.now() - t}ms${why ? ` failed: ${why}` : ""}`);
       continue;
     }
-    const { why, method } = await fillDropdown(page, f.selector, f.value, hints, guide?.prefer(f.selector) === "clicked");
+    let { why, method } = await fillDropdown(page, f.selector, f.value, hints, guide?.prefer(f.selector) === "clicked");
+    // A state or province list without the candidate's region lists provinces, named after their main town: the city
+    // is tried next ("Puglia" missing, "Bari" there).
+    const region = [profile.address.region, profile.address.regionCode].filter(Boolean).map((x) => norm(x as string));
+    if (why && f.required !== false && /no option matches/.test(why) && region.includes(norm(f.value)) && profile.address.city) {
+      const again = await fillDropdown(page, f.selector, profile.address.city, hints, true);
+      if (!again.why) ({ why, method } = { why: null, method: again.method });
+      trace(`dropdown ${f.selector}: region "${f.value}" not listed, city "${profile.address.city}" ${again.why ? "not listed either" : "picked"}`);
+    }
     if (why) failed.push({ selector: f.selector, why });
     else how.set(f.selector, method);
     await page.writesSettled(BROWSER.saveMs);
     trace(`dropdown ${f.selector} ${Date.now() - t}ms${why ? ` failed: ${why}` : ""}`);
+  }
+  // A list that matched nothing may hang on another set after it (a state list filled once the country is chosen): it
+  // is tried once more now that every list holds its value.
+  // Only a required one: an optional list that took nothing is left empty, with no more time spent on it.
+  for (const f of fills.filter((x) => x.kind === "combobox" && x.required !== false && !panels.has(x.selector))) {
+    const at = failed.findIndex((x) => x.selector === f.selector && /no option matches/.test(x.why));
+    if (at < 0) continue;
+    const region = [profile.address.region, profile.address.regionCode].filter(Boolean).map((x) => norm(x as string));
+    const tries = region.includes(norm(f.value)) && profile.address.city ? [f.value, profile.address.city] : [f.value];
+    for (const value of tries) {
+      const { why, method } = await fillDropdown(page, f.selector, value, hints, true);
+      trace(`dropdown ${f.selector}: "${value}" again after the other lists: ${why ?? "picked"}`);
+      if (why) continue;
+      failed.splice(at, 1);
+      how.set(f.selector, method);
+      break;
+    }
   }
   // A calendar is clicked through: there is nothing to type.
   for (const f of fills.filter((x) => x.kind === "calendar")) {
@@ -176,9 +212,24 @@ const DATE_TYPED = /^(\d{1,4}[\/.-]\d{1,2}[\/.-]\d{1,4}|\d{1,2}[\/.-]\d{4}|(19|2
 /** Types into a field with real key input, for the rare control that ignores a value set from script. */
 function typeInto(page: Page, selector: string, value: string): Promise<string | null> {
   return inFront(page, async () => {
-    const p = await page.awj<Point>("point", selector);
+    let p = await page.awj<Point>("point", selector);
     if (!p.ok) return "control not found";
+    // A slider is set to the number in the value; it has nothing to type into.
+    if ((await page.awj<string | null>("setRange", selector, value)) !== null) return null;
+    // A box that already shows this value (a date the site read from the resume: "01/2022" for 2022-01-01) keeps it.
+    const before = await page.awj<string>("shown", selector);
+    if (before && showsValue(value, before)) return null;
     await page.click(p.x, p.y);
+    if (!(await page.awj<boolean>("hasFocus", selector))) {
+      // A calendar left open by the box before can lie over this one and take the click (inRecruiting's month boxes,
+      // one under the other): it is closed, and the box clicked again, then focused from script.
+      await page.key("Escape");
+      await page.evaluate("window.__awj.blur()");
+      await sleep(BROWSER.pollMs);
+      p = await page.awj<Point>("point", selector);
+      if (p.ok) await page.click(p.x, p.y);
+      if (!(await page.awj<boolean>("hasFocus", selector))) await page.awj<boolean>("focus", selector);
+    }
     // Keys go wherever the focus is, so no focus on this exact control means no typing.
     if (!(await page.awj<boolean>("hasFocus", selector))) return "could not focus the control";
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -200,7 +251,8 @@ function typeInto(page: Page, selector: string, value: string): Promise<string |
       if (DATE_TYPED.test(value)) {
         await page.key("Escape");
         await sleep(BROWSER.pollMs);
-        if (!(await page.awj<string>("shown", selector)) && (await page.awj<boolean>("focus", selector))) {
+        // Put back means empty, or the date the box held before (a profile the site kept from an earlier application).
+        if (!showsValue(value, await page.awj<string>("shown", selector)) && (await page.awj<boolean>("focus", selector))) {
           await page.evaluate("window.__awj.selectAll()");
           await page.key("Backspace");
           await page.typeKeys(value);
@@ -211,11 +263,40 @@ function typeInto(page: Page, selector: string, value: string): Promise<string |
       await sleep(BROWSER.pollMs);
       const kept = await page.awj<string>("shown", selector);
       if (DATE_TYPED.test(value)) trace(`typed date into ${selector.slice(-40)}, try ${attempt + 1}: the box shows "${kept}"`);
-      if (kept) break;
+      if (kept && (!DATE_TYPED.test(value) || showsValue(value, kept))) break;
+    }
+    // A date box that names no format and threw the date away (Cornerstone's work entry takes "01/2022" only) is given
+    // the same date in the other ways boxes write one, month and year first. "Present" for the job the candidate still
+    // holds is this month, in a box that has no word for it.
+    if (!(await page.awj<string>("shown", selector))) {
+      for (const other of otherDateShapes(value)) {
+        if (!(await page.awj<boolean>("focus", selector))) break;
+        await page.evaluate("window.__awj.selectAll()");
+        await page.key("Backspace");
+        await page.typeKeys(other);
+        await page.key("Escape");
+        await page.evaluate("window.__awj.blur()");
+        await sleep(BROWSER.pollMs);
+        const kept = await page.awj<string>("shown", selector);
+        trace(`typed date into ${selector.slice(-40)} as "${other}": the box shows "${kept}"`);
+        if (kept) break;
+      }
     }
     await page.evaluate("window.__awj.blur()");
     return null;
   });
+}
+
+/** The same date in the shapes a box with no stated format may want: month/year, then the full date both ways when the day cannot be misread. */
+export function otherDateShapes(value: string, today = new Date()): string[] {
+  const d = PRESENT.test(value.trim()) ? { year: today.getFullYear(), month: today.getMonth() + 1, day: 1 } : toYmd(value);
+  if (!d || !(DATE_TYPED.test(value) || PRESENT.test(value.trim()) || /\d{4}/.test(value))) return [];
+  const mm = String(d.month).padStart(2, "0");
+  const dd = String(d.day).padStart(2, "0");
+  const shapes = [`${mm}/${d.year}`, `${mm}-${d.year}`];
+  // 03/04/2022 reads two ways; a day that is also a possible month only goes in when both readings are the same day.
+  if (d.day > 12 || d.day === d.month) shapes.push(`${mm}/${dd}/${d.year}`, `${dd}/${mm}/${d.year}`);
+  return [...new Set(shapes)].filter((s) => s !== value);
 }
 
 /** Picks a choice in a button group or a drawn radio row with a real click, for the group that ignores a click made from script. */
@@ -258,8 +339,13 @@ export async function uploadFile(page: Page, selector: string, file: string): Pr
   return why;
 }
 
-/** The button that closes an upload dialog once it holds the file. */
-const DIALOG_DONE = "^\\s*(done|ok|save|confirm|fatto|salva|conferma|fertig|speichern|ok, fertig|terminé|enregistrer|listo|guardar)\\s*$";
+/**
+ * The button that closes an upload dialog once it holds the file. A photo is often shown in a crop dialog first
+ * (Workable: "Crop your photo", then "Upload"); the form holds the photo only once that is pressed.
+ */
+const DIALOG_DONE =
+  "^\\s*(done|ok|save|confirm|fatto|salva|conferma|fertig|speichern|ok, fertig|terminé|enregistrer|listo|guardar|" +
+  "upload|crop|apply|use (this )?(photo|image)|carica|ritaglia|applica|usa (questa )?(foto|immagine)|hochladen|zuschneiden|übernehmen|télécharger|recadrer|appliquer|subir|recortar|aplicar)\\s*$";
 
 /**
  * A form whose "Add file" button opens a dialog of its own (HiBob): the button is pressed, the file goes into

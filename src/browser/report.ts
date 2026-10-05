@@ -5,12 +5,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { FORM, PATHS } from "../config.js";
+import { PATHS } from "../config.js";
 import type { FieldsDump, FillPlan } from "../forms/fields.js";
 import type { Resolution } from "../answers/memory.js";
 import type { ControlState } from "./session.js";
 
-export type Fill = { selector: string; kind: string; value: string };
+export type Fill = { selector: string; kind: string; value: string; required?: boolean };
 export type FieldReport = { label: string; required: boolean; action: string; shown: string; note: string | null };
 export type TakeHome = { text: string; url: string };
 export type FillReport = {
@@ -170,10 +170,11 @@ export function splitFailures(plan: Pick<FillPlan, "fields">, failed: Failure[],
     const field = plan.fields[i];
     // A pay box that refuses words wants a number, and the profile gives none: say so instead of "did not land".
     const f = field && /salary|compensation|pay\b/i.test(field.label) && /did not keep|not confirmed/.test(given.why) ? { ...given, why: "the pay box takes only a number, and your profile gives no pay figure" } : given;
-    const harmless = !!field && !field.required && !shown[i] && field.action !== "upload" && field.kind !== "file" && !/refused/.test(f.why);
+    // A list that still shows its own prompt ("Seleziona tipo", "Select...") holds nothing.
+    const empty = !shown[i] || /^\s*(seleziona|select|choose|scegli|please select|no selection|nessuna selezione|keine auswahl|bitte wählen|sélectionne[rz]?|selecciona|-+\s*$)/i.test(shown[i] ?? "");
+    const harmless = !!field && !field.required && empty && field.action !== "upload" && field.kind !== "file" && !/refused/.test(f.why);
     (harmless ? leftBlank : holds).push(f);
   }
-  // One or two optional boxes that would not take a value are a quirk of the form. Many are a fill that went wrong.
-  if (leftBlank.length > FORM.maxLeftBlank) return { holds: [...holds, ...leftBlank], leftBlank: [] };
+  // An optional box that would not take a value never holds the application, however many there are (owner, 2026-10-04).
   return { holds, leftBlank };
 }

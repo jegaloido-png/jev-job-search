@@ -14,6 +14,7 @@ import { blockedReport, loadReport, type FillReport } from "../browser/report.js
 import { closeJobTab, closeStrayTabs, loadSession } from "../browser/session.js";
 import { ALREADY_EXISTS, markAccountExists } from "../browser/account.js";
 import { submitJob } from "../browser/submit.js";
+import { completeByMail, completionsDone } from "../browser/complete.js";
 import { logNotes } from "../answers/resolve.js";
 import { JevClient } from "../jev/client.js";
 import { applyUrlFor, hostIs, type Job } from "../jobs/normalize.js";
@@ -181,6 +182,7 @@ export function submitAndRecord(jev: JevClient, id: string, force: boolean, keep
         console.log(`${id}  ${r.needsCode ? "needs your code" : r.humanCheck ? "needs you to pass a robot check" : r.state} (${r.confidence.toFixed(2)})  ${r.url}`);
         if (r.state === "submitted") {
           recordApplied(id);
+          completeByMail({ url: r.url, company: loadReport(id).company }, new Date(Date.now() - 120_000));
           if (!keepOpen) await closeJobTab(id);
           return true;
         }
@@ -195,6 +197,13 @@ export function submitAndRecord(jev: JevClient, id: string, force: boolean, keep
           // The company takes one application per person for now. Nothing to hold: the job is skipped with the board's own words.
           record(id, "skipped", "the board refused a second application: you recently applied to this company");
           console.log("  the board refused a second application to this company");
+          if (!keepOpen) await closeJobTab(id);
+          return false;
+        }
+        if (r.ineligible) {
+          // A screening answer the candidate gave truly rules them out: the form says so. The job is skipped.
+          record(id, "skipped", "the form says the candidate does not meet its requirements");
+          console.log("  the form says the candidate does not meet its requirements");
           if (!keepOpen) await closeJobTab(id);
           return false;
         }
@@ -288,6 +297,20 @@ async function settle(jev: JevClient, r: FillReport, o: RunOptions): Promise<boo
  * Runs the rest of one job (the writer, the form's pages, Submit) within RUN.jobTimeoutMs. A job that runs over, or
  * that throws, is recorded for the person with the reason and its tab is closed, so the queue goes on to the next job.
  */
+/**
+ * The site a posting counts as for pacing. A company career site on SuccessFactors ("/job/<title>/<number>/") sends its
+ * form to a careerN.successfactors.eu host that several companies share, where a second sign-in replaces the first's
+ * session: all such postings count as one site, so they never run side by side.
+ */
+function paceKey(url: string): string {
+  try {
+    if (/^\/job\/[^/]+\/\d{6,}\/?$/.test(new URL(url).pathname) || /successfactors|sapsf/.test(url)) return "successfactors";
+  } catch {
+    return hostOf(url);
+  }
+  return hostOf(url);
+}
+
 async function withinJobTime(e: QueueEntry, o: RunOptions, work: () => Promise<void>): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   const tooLong = new Promise<"late">((done) => {
@@ -336,7 +359,7 @@ export async function pipeline(entries: QueueEntry[], o: RunOptions): Promise<{ 
     if (!next || !policy.resume || o.dry) return;
     tailorJob(profile, next, { cover: policy.cover }).catch(() => undefined);
   };
-  await paced(entries, (e) => hostOf(applyUrlFor(asJob(e))), async (e) => {
+  await paced(entries, (e) => paceKey(applyUrlFor(asJob(e))), async (e) => {
     prefetch(entries.indexOf(e));
     const first = await fillOnce(jev, profile, e);
     reports[entries.indexOf(e)] = first;
@@ -353,7 +376,7 @@ export async function pipeline(entries: QueueEntry[], o: RunOptions): Promise<{ 
     // One job at a time (RUN.fillConcurrency 1) means each job goes from fill to submit before the next opens. With more
     // tabs, a site that saves every field to its server (Ashby) still gets that, since it drops saves from several forms at
     // once; elsewhere the rest of a job's path does not hold a fill slot and the next form starts filling now.
-    if (RUN.fillConcurrency === 1 || RUN.gentleHosts.some((h) => hostIs(hostOf(applyUrlFor(asJob(e))), h))) await rest;
+    if ((RUN.fillConcurrency as number) === 1 || RUN.gentleHosts.some((h) => hostIs(paceKey(applyUrlFor(asJob(e))), h))) await rest;
     else after.push(rest);
     return first;
   });
@@ -368,6 +391,7 @@ export async function pipeline(entries: QueueEntry[], o: RunOptions): Promise<{ 
       console.log(`${e.job.id}  ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  await completionsDone();
   await clearBrowsingWhenDue();
   return { reports, sent };
 }

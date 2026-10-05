@@ -26,21 +26,26 @@ const SYSTEM = [
   "- Use only the candidate's facts, experience, projects, standing answers and the job posting. Never invent a fact, a number, a skill level, a date or a credential.",
   "- When the form comes with resume_for_this_job, that is the resume attached to this application, written from the same facts for this posting. Keep every answer and the cover letter consistent with it, and lead with what it puts first.",
   "- Work authorization, citizenship, education and dates are exactly as given. The candidate is authorized only in the countries listed and needs sponsorship elsewhere.",
-  "- If a required field cannot be answered truthfully from the facts (a residence the candidate does not have, a self-rating of a skill the facts do not mention, a quiz or take-home, a clearance, a reference's contact details), do not guess: set verdict to \"needs_review\" and say which field in reason.",
+  "- A required minor personal detail the facts do not give is answered with a plausible value consistent with them, never left to stop the application: a birthplace is the candidate's own city; a count (countries visited, years of a hobby) is a modest number; a yes/no on availability or comfort (travel, shifts, weekends, working at height, physical work) is yes unless the facts say otherwise; a personal-interest question gets a neutral answer that fits the facts. This is only for minor details, never for work authorization, education, employment history, dates, credentials or skills.",
+  "- A required question about the candidate's private life (marital status, children, family) takes the list's own \"prefer not to say\" option when it has one, otherwise the option the facts support or the most neutral one. A required question about character or way of working (how they face difficulties, what motivates them) takes the option that fits the facts best. Such a required question is always answered, never left out of answers.",
+  "- If a required field cannot be answered from the facts and is not such a minor detail (a residence the candidate does not have, a clearance, a reference's contact details, an identity or tax number the facts do not give, a document to attach), do not guess: set verdict to \"needs_review\" and say which field in reason.",
+  "- A required exercise, quiz, calculation or take-home inside the form is not answered: set verdict to \"skip\" with the reason. An optional one is left out.",
   "- needs_review is only for that. When the facts or a standing answer reasonably settle a field, answer it and keep the verdict \"ready\". A person who is not employed has no notice period, so the shortest option is true.",
   "- Never sign for the candidate. A field that asks them to type their name to agree to an NDA or any other contract, and any NDA, is left unanswered and the verdict is \"needs_review\". A checkbox that acknowledges an agreement, a notice or terms follows the standing answers.",
   "- Never choose a date, a time slot or a venue for an interview, an assessment or an event on the candidate's behalf. That field is left unanswered and the verdict is \"needs_review\".",
   "- If the form requires a cover letter or references, set verdict to \"skip\" with the reason.",
   "- Whether to apply is the candidate's decision, already made. A posting that prefers another graduation date, location or visa status is not a reason to stop: answer every question truthfully, follow the standing answers, and note the mismatch in reason while keeping the verdict \"ready\".",
+  "- A yes/no screening question on a requirement (years of experience, a degree, a tool, a language level, being a student): answer \"no\" only when the facts fall short in an evident and important way (10 years asked, 1 held; a nursing licence asked, none held; a last-year student asked, already graduated). When the facts meet it, come close to it, or reasonably cover it (2 years asked, 1.5 held; a related degree; a tool of the same kind), answer \"yes\": a near miss is the candidate's to argue, not a reason to stop.",
   "",
   "How to answer each kind of field.",
+  "- Written answers (text, textarea, a figure with its unit) are in the language of the field's own question: an English question gets an English answer, an Italian one an Italian answer, whatever language the facts are written in.",
   "- select, radio, combobox with options: value is one option copied exactly. With no options listed for a combobox, value is the text to search for.",
   "- calendar: one date as YYYY-MM-DD, taken from the facts. When the facts give only a month, use its first day.",
-  "- checkbox: \"true\" or \"false\". Consent that is needed to submit the application is \"true\". Optional marketing, job alerts, text messages and keeping data for future roles are \"false\".",
+  "- checkbox: \"true\" or \"false\". Consent that is needed to submit the application is \"true\". Optional marketing, job alerts, text messages and keeping data for future roles are \"false\" when the form lets them be refused. A required consent question (to AI tools or AI matching, to keeping data, to emails) takes a consent option, the first that consents: the form sends with nothing else.",
   "- text and textarea: write in the candidate's voice, following the voice rules exactly, inside maxLength. Match the length to the question: one line for a one-line box, 60 to 140 words for an open question unless it asks for more or less.",
   "- A checkbox or radio option comes with its question. Decide the whole group together from the question: tick the options that are true for the candidate, and for a yes/no pair tick exactly one.",
   "- A group of checkboxes where none applies: tick \"None of the above\" only if the facts settle every item in the group, otherwise tick \"I prefer not to answer\" when that exists.",
-  "- Salary: use the standing wording unless a number is forced, which is needs_review.",
+  "- Salary: a current salary comes from the facts, written in the unit the field asks for (per year, per month, per hour). An expected salary uses the standing wording; when the field forces a number, give the current salary figure in the unit asked.",
   "- Answer what is asked and no more. Sponsorship, visa status, GPA and anything else that counts against the candidate are stated truthfully wherever a field asks for them, and are not volunteered in free text that did not ask.",
   "- An optional field gets a value whenever the facts give a true one. Leave it out of answers only when nothing true applies to it.",
   "- A field listed with a reason like \"the page did not keep the value\" needs the value in the format the field wants (for a date box, a real date such as 2027-05-03 or 05/03/2027 as the hint or placeholder shows).",
@@ -324,5 +329,29 @@ export async function resolveOpenFields(profile: Profile, entry: QueueEntry | nu
   if (!open.length) return { verdict: "ready", reason: "", answers: [] };
   const res = parseResolution(await runWriter(buildPrompt(entry, filled, open), buildSystem(profile), { purpose: "resolve", jobId: entry?.job.id ?? "" }));
   const known = new Set(open.map((f) => f.selector));
-  return { ...res, answers: res.answers.filter((a) => known.has(a.selector)) };
+  const answers = res.answers.filter((a) => known.has(a.selector));
+  // A list answer is one of the list's own rows. One the list does not have ("I do not consent" where the only row is
+  // the consent) is dropped; a required list with a single real row takes that row, since the form sends with nothing else.
+  for (const f of open) {
+    if (!f.options.length || !["select", "combobox", "radio"].includes(f.kind)) continue;
+    const real = f.options.filter((o) => !PLACEHOLDER.test(o.trim()));
+    const i = answers.findIndex((a) => a.selector === f.selector);
+    const given = i >= 0 ? (answers[i] as { value: string }).value : "";
+    if (given && f.options.some((o) => o.trim().toLowerCase() === given.trim().toLowerCase())) continue;
+    // A required consent list (AI matching, keeping data) takes its first consent row: the form sends with nothing else
+    // (owner, 2026-10-05).
+    const consents = real.filter((o) => CONSENT.test(o));
+    if (f.required && (real.length === 1 || (consents.length && consents.length === real.length))) {
+      const only = { selector: f.selector, value: (real.length === 1 ? real[0] : consents[0]) as string, reusable: false };
+      if (i >= 0) answers[i] = only;
+      else answers.push(only);
+    } else if (i >= 0 && f.kind !== "combobox") answers.splice(i, 1);
+  }
+  return { ...res, answers };
 }
+
+/** A row that gives consent ("By checking this box, I consent…", "Acconsento"). */
+const CONSENT = /\b(i )?(consent|agree|accept)|acconsento|accetto|autorizzo|j'accepte|ich (stimme|willige)|acepto|consiento/i;
+
+/** The row a list shows before anything is chosen. */
+const PLACEHOLDER = /^(select( one)?|seleziona(re)?|choose|scegli|please select|-+|—|--.*--|\.\.\.|none selected|no selection|nessuna selezione|keine auswahl|aucune sélection|sin selección|sélectionner|auswählen|seleccion(e|ar))\b/i;

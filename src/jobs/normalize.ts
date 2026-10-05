@@ -189,8 +189,12 @@ export function applyUrlFor(job: Pick<Job, "url" | "ats">): string {
     const slug = /greenhouse\.io\/(?:embed\/job_app\?for=)?([a-z0-9_-]+)/i.exec(job.url)?.[1] ?? /[?&]for=([a-z0-9_-]+)/i.exec(job.url)?.[1];
     const id = /\/jobs\/(\d+)/.exec(job.url)?.[1] ?? /[?&](?:gh_jid|token)=(\d+)/.exec(job.url)?.[1];
     if (slug && id && slug !== "embed") return greenhouseEmbedUrl(slug, id, /\.eu\.greenhouse\.io/i.test(job.url));
-    return job.url;
   }
+  // A company's own careers page that carries a Greenhouse job id ("?gh_jid=6102149") may show no Apply at all
+  // (Suitsupply). Greenhouse opens the posting's form from the id alone and names the board itself.
+  const ghId = /[?&]gh_jid=(\d+)/.exec(job.url)?.[1];
+  if (ghId && !/greenhouse\.io/i.test(job.url)) return `https://boards.greenhouse.io/embed/job_app?token=${ghId}`;
+  if (job.ats === "greenhouse") return job.url;
   if (job.ats === "lever") {
     const m = /^(https:\/\/jobs\.lever\.co\/[^/]+\/[0-9a-f-]{36})/i.exec(job.url);
     return m ? `${m[1]}/apply` : job.url;

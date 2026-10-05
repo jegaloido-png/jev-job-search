@@ -6,10 +6,23 @@
 export type Ymd = { year: number; month: number; day: number };
 
 const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
-/** The month a word names: the full name or a short form of it ("Sep", "Sept."). "Maybe" is not May. */
+// Boards in other languages write their own month names ("Set 2020" on an Italian form is September).
+const LOCAL_MONTHS = [
+  ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+  ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
+  ["januar", "februar", "märz", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "dezember"],
+  ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+  ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
+];
+/** The month a word names: the full name or a short form of it ("Sep", "Sept.", "Set"). "Maybe" is not May. */
 const monthIndex = (word: string) => {
   const w = word.toLowerCase().replace(/\.$/, "");
-  return w.length < 3 ? -1 : MONTHS.findIndex((m) => m.startsWith(w));
+  if (w.length < 3) return -1;
+  for (const names of [MONTHS, ...LOCAL_MONTHS]) {
+    const i = names.findIndex((m) => m.startsWith(w));
+    if (i >= 0) return i;
+  }
+  return -1;
 };
 
 /**
@@ -20,13 +33,16 @@ export function toYmd(value: string): Ymd | null {
   const v = value.trim();
   let m = /^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/.exec(v);
   if (m) return valid({ year: Number(m[1]), month: Number(m[2]), day: Number(m[3] ?? 1) });
+  // A month and year with no day ("09-2020", "09/2020"), as month pickers write it: its first day.
+  m = /^(\d{1,2})[\/.-](\d{4})$/.exec(v);
+  if (m) return valid({ year: Number(m[2]), month: Number(m[1]), day: 1 });
   m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(v);
   if (m) return valid({ year: Number(m[3]), month: Number(m[1]), day: Number(m[2]) });
   m = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/.exec(v);
   if (m && monthIndex(m[1] as string) >= 0) return valid({ year: Number(m[3]), month: monthIndex(m[1] as string) + 1, day: Number(m[2]) });
   m = /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(v);
   if (m && monthIndex(m[2] as string) >= 0) return valid({ year: Number(m[3]), month: monthIndex(m[2] as string) + 1, day: Number(m[1]) });
-  m = /^([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(v);
+  m = /^(\p{L}{3,9})\.?,?\s+(\d{4})$/u.exec(v);
   if (m && monthIndex(m[1] as string) >= 0) return valid({ year: Number(m[2]), month: monthIndex(m[1] as string) + 1, day: 1 });
   return null;
 }
@@ -59,6 +75,9 @@ export function dateFormatOf(text: string): string | null {
   // Italian "gg-mm-aaaa", French "jj/mm/aaaa" and German "TT.MM.JJJJ" name the same parts in their own letters.
   const local = text.replace(/\b(gg|jj|tt)(?=[\/.-])/gi, "dd").replace(/(?<=[\/.-])(gg|jj|tt)\b/gi, "dd").replace(/\b(aaaa|jjjj)\b/gi, "yyyy");
   const m = /\b(mm|dd|yyyy)([\/.-])(mm|dd|yyyy)\2(mm|dd|yyyy)\b/i.exec(local);
+  // A month picker names a month and a year only ("mm-aaaa", "MM/YYYY").
+  const my = m ? null : /\b(mm[\/.-]yyyy|yyyy[\/.-]mm)\b/i.exec(local);
+  if (my) return (my[1] as string).toLowerCase();
   if (!m) return null;
   const parts = [m[1], m[3], m[4]].map((p) => (p as string).toLowerCase());
   return new Set(parts).size === 3 ? parts.join(m[2] as string) : null;
@@ -77,6 +96,9 @@ export function shapedForBox(value: string, boxText: string): string {
  * gains brackets, a link gains its scheme, a date is written in the box's own format, and a long
  * answer loses its double spaces. What they must not do is show something else.
  */
+/** "Present" and its words in other languages: the end of a job the candidate still holds. */
+export const PRESENT = /^(present|current|now|today|presente|attuale|ad oggi|oggi|in corso|actuel|aujourd'hui|aktuell|heute|actual|actualidad|atual)$/i;
+
 export function showsValue(want: string, shown: string): boolean {
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
   const w = norm(want);
@@ -84,7 +106,13 @@ export function showsValue(want: string, shown: string): boolean {
   if (!s) return false;
   if (w === s) return true;
   // One inside the other: a city shown with its region, a link shown without its scheme. A bare number is not loose like that.
-  if ((/[a-z]/.test(w) || w.length >= 4) && (s.includes(w) || w.includes(s))) return true;
+  // Whole words only: "Male" is not inside "Female".
+  const within = (outer: string, inner: string) => new RegExp(`(^|[^a-z0-9])${inner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`).test(outer);
+  if ((/[a-z]/.test(w) || w.length >= 4) && (within(s, w) || within(w, s))) return true;
+  // Several things picked one by one from a list ("Excel, Word, Outlook" shown as "Microsoft Excel, Microsoft Word"):
+  // one of them shown is the value taken.
+  const items = w.split(",").map((x) => x.trim()).filter((x) => x.length >= 3);
+  if (items.length >= 3 && items.some((x) => within(s, x))) return true;
   // Numbers: the same digits, or a phone shown with the country code the box added in front.
   const digits = (x: string) => x.replace(/\D/g, "");
   const dw = digits(w);
@@ -92,11 +120,17 @@ export function showsValue(want: string, shown: string): boolean {
   if (dw && ds && (dw === ds || (Math.min(dw.length, ds.length) >= 7 && (dw.endsWith(ds) || ds.endsWith(dw))))) return true;
   const d = toYmd(want);
   if (d && showsDate(shown, d)) return true;
+  // "Present" written as this month by a box that has no word for it.
+  const now = new Date();
+  const asDate = toYmd(shown.trim());
+  if (PRESENT.test(w) && asDate && asDate.year === now.getFullYear() && asDate.month === now.getMonth() + 1) return true;
   // A place picked from a list comes back in the list's own spelling: "Edmonton, Alberta, Canada" shows as "Edmonton, AB, CAN".
   const place = (x: string) => x.split(",")[0]?.trim() ?? "";
   if (w.includes(",") && s.includes(",") && place(w).length >= 3 && place(w) === place(s)) return true;
-  // A pick shown as its short form: "Canada" chosen, "+1 CA" shown.
-  if (/[a-z]/.test(w) && s.split(/[^a-z]+/).some((part) => part.length >= 2 && (w.split(/[^a-z]+/)[0] ?? "").startsWith(part))) return true;
+  // A pick shown as its short form: "Canada" chosen, "+1 CA" shown. Only a shown value made of short forms counts:
+  // "I am a current SEL Employee" does not show "SEL Website" because both hold "SEL".
+  const parts = s.split(/[^a-z]+/).filter(Boolean);
+  if (/[a-z]/.test(w) && parts.length && parts.every((part) => part.length <= 3) && parts.some((part) => part.length >= 2 && (w.split(/[^a-z]+/)[0] ?? "").startsWith(part))) return true;
   const bare = (x: string) => x.replace(/^https?:\/\/(www\.)?/, "").replace(/\/+$/, "");
   return bare(w) === bare(s);
 }

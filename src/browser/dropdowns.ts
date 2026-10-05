@@ -6,8 +6,9 @@
 import { BROWSER, FORM } from "../config.js";
 import type { DumpedField } from "../forms/fields.js";
 import { sleep, type Page } from "./cdp.js";
-import { inFront, norm, shownValues, type Point } from "./session.js";
+import { inFront, norm, shownValues, trace, type Point } from "./session.js";
 import { showsValue } from "../util/dates.js";
+import { toEnglish, toItalian } from "../forms/localWords.js";
 
 /** Polls an open dropdown until its options settle, or until `enough` says the wanted one has arrived. */
 async function waitOptions(page: Page, selector: string, typed: boolean, enough?: (opts: string[]) => boolean): Promise<string[]> {
@@ -37,9 +38,35 @@ async function waitOptions(page: Page, selector: string, typed: boolean, enough?
  * matches "Edmonton, AB, Canada": same first part, and at least one of the candidate's places named.
  * Returns null rather than something merely similar.
  */
-export function pickOption(options: string[], value: string, hints: string[]): string | null {
+/** The ways a list lets a person decline a voluntary question, in the languages the boards use. */
+export const DECLINE = /prefer not|rather not|do not wish|don'?t wish|not wish to|decline|not to (say|disclose|answer|self.?identify)|choose not|preferisco non|non desider|non (voglio|intendo) (rispondere|dichiarare)|keine angabe|möchte (ich )?nicht|ne (souhaite|veux) pas|prefiero no|no deseo|prefiro não/i;
+
+/** The same degree level in the words of other languages: a value matching the first is looked for as the second. */
+const DEGREE_KIN: [RegExp, RegExp][] = [
+  [/laurea (triennale|di primo livello)|^laurea$|bachelor|licence|grado/, /bachelor|\bba\b|\bbsc\b|undergraduate|laurea (triennale|di primo livello)|licence|grado|first.?level/],
+  [/laurea (magistrale|specialistica)|master/, /master|\bmsc\b|\bma\b|postgraduate|laurea (magistrale|specialistica)|second.?level/],
+  [/dottorato|ph\.?d|doctor/, /ph\.?d|doctor|dottorato/],
+  [/diploma (di maturità|superiore)|high school|maturità|ragioneria/, /high school|secondary|diploma|maturità|a.?level/],
+];
+
+export function pickOption(options: string[], value: string, hints: string[], other = true): string | null {
   const want = norm(value);
   if (!want) return null;
+  const found = pickIn(options, value, want, hints);
+  if (found || !other) return found;
+  // A list that names a country or a language in the other language ("Italia" in a list of English names, "Italy" in
+  // an Italian one) is tried with the value in that language.
+  for (const v of [toEnglish(value), toItalian(value)]) if (v !== value) {
+    const kin = pickOption(options, v, hints, false);
+    if (kin) return kin;
+  }
+  return null;
+}
+
+function pickIn(options: string[], value: string, want: string, hints: string[]): string | null {
+  // Declining a voluntary question takes the list's own way of declining, and nothing near it: "I do not wish to
+  // answer" is never matched by its words to "Bisexual" or "Non binary".
+  if (DECLINE.test(value)) return options.find((o) => DECLINE.test(o)) ?? null;
   const word = (h: string) => new RegExp(`(^|[^a-z0-9])${norm(h).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`);
   const score = (o: string) => hints.filter((h) => h && word(h).test(norm(o))).length;
   const best = (pool: string[]) => [...pool].sort((a, b) => score(b) - score(a) || a.length - b.length)[0] ?? null;
@@ -48,6 +75,19 @@ export function pickOption(options: string[], value: string, hints: string[]): s
   const includes = options.filter((o) => norm(o).includes(want));
   const pool = exact.length ? exact : starts.length ? starts : includes;
   if (pool.length) return best(pool);
+  // A degree named the Italian way, in a list that names degrees in English (or the other way round).
+  for (const [re, kin] of DEGREE_KIN) {
+    if (!re.test(want)) continue;
+    const same = options.filter((o) => kin.test(norm(o)));
+    if (same.length) return best(same);
+  }
+  // A country asked as a nationality: "Italy" is "Italian", "Italiana", "Citizen (Italian)"; "Germany" is "German".
+  // A one-word value matches a word that starts with all of it but its last letter.
+  if (/^[a-z]{5,}$/.test(want)) {
+    const stem = want.slice(0, -1);
+    const kin = options.filter((o) => norm(o).split(/[^a-z]+/).some((w) => w.startsWith(stem) && w.length <= want.length + 4));
+    if (kin.length) return best(kin);
+  }
   // A street address comes back in the list's own order ("Via Roma 1, Bari" as "Via Roma, 1, 70131 Bari, Italy"):
   // the same street, the same house number, and one part that is the candidate's city once its postal code is taken off.
   const street = /^(\D+?)[\s,]+(\d+[a-z]?)$/i.exec((value.split(",")[0] ?? "").trim());
@@ -192,29 +232,24 @@ export function fillDropdownByClicking(page: Page, selector: string, value: stri
   return inFront(page, () => clickAndPick(page, selector, value, hints));
 }
 
-async function clickAndPick(page: Page, selector: string, value: string, hints: string[]): Promise<string | null> {
-  // A Workday prompt keeps every pick: one that is not the wanted value (left by an earlier try) is removed first.
-  if (await page.awj<boolean>("isPrompt", selector)) {
-    for (let i = 0; i < 6; i++) {
-      const picks = await page.awj<(Point & { label: string })[]>("promptPicks", selector);
-      // A pick holds the value when it names it whole ("Citizen (Italy)" for Italy); the looser page check would take
-      // "Citizen (Italy)" for "Citizen (Nepal)".
-      const holds = (label: string) => norm(label) === norm(value) || norm(label).includes(norm(value));
-      const wrong = picks.find((p) => p.ok && !holds(p.label));
-      if (!wrong) {
-        if (picks.some((p) => holds(p.label))) return null;
-        break;
-      }
-      await page.click(wrong.x, wrong.y);
-      await sleep(BROWSER.pollMs * 3);
-      // Removing a pick opens the list; it is closed so the next click opens it afresh with the keyboard in the box.
-      await closeDropdown(page);
-      await sleep(BROWSER.pollMs * 2);
-    }
+async function clickAndPick(page: Page, selector: string, value: string, hints: string[], keep = false): Promise<string | null> {
+  const prompt = await page.awj<boolean>("isPrompt", selector);
+  // A list of several things for a prompt that takes many picks ("Excel, Word, Outlook" for the skills) is picked one
+  // item at a time: the whole line is no row of the list. A place ("Bari, Italia") is one thing.
+  const items = value.split(",").map((s) => s.trim()).filter(Boolean);
+  if (prompt && !keep && items.length > 1 && norm(items[0] ?? "") !== norm(hints[0] ?? "")) {
+    let picked = 0;
+    for (const item of items.slice(0, 5)) if (!(await clickAndPick(page, selector, item, hints, true))) picked++;
+    trace(`dropdown ${selector}: ${picked} of ${Math.min(items.length, 5)} items picked one by one`);
+    return picked ? null : `no option matches any of "${value}"`;
   }
+  // A Workday prompt keeps every pick: one that is not the wanted value (left by an earlier try) is removed first.
+  if (prompt && !keep && (await dropWrongPicks(page, selector, value))) return null;
   // A list that already shows the value keeps it: a committed choice is not picked again.
   const before = (await shownValues(page, [selector]))[0] ?? "";
-  if (before && showsValue(value, before)) return null;
+  if (before && showsValue(value, before) && !(await page.awj<boolean>("pickPending", selector))) return null;
+  // A list another control left open (an address's suggestions) would be read as this one's rows: it is closed first.
+  await closeDropdown(page);
   if (!(await openDropdown(page, selector))) return "control not found";
   let opts = await waitOptions(page, selector, false);
   if (!opts.length) {
@@ -228,12 +263,29 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   const [city, region] = hints;
   if (city && region && norm(value) === norm(region) && opts.some((o) => norm(o) === norm(city)) && opts.some((o) => norm(o) === norm(region))) value = city;
   let choice = pickOption(opts, value, hints);
+  // A list that draws only the rows in view (Workday's prompts) may hold the row further down: the list is scrolled
+  // until the row is drawn ("Website" under ten other sources), before any search. Only a short list: a long one
+  // (countries, citizenships) is searched instead.
+  const short = !choice && (await page.awj<boolean>("listIsPartial", selector)) && (await page.awj<number>("listSize", selector)) <= FORM.maxOptionsForJev;
+  for (let i = 0; short && !choice && i < 10 && (await page.awj<boolean>("scrollList", selector)); i++) {
+    await sleep(BROWSER.pollMs);
+    const more = await page.awj<string[]>("options", selector);
+    if (more.join("|") === opts.join("|")) break;
+    opts = more;
+    choice = pickOption(opts, value, hints);
+  }
   if (!choice) {
     // Search-as-you-type lists. A place is searched by its city; anything else by the full value, then its first word.
     const head = value.split(",")[0]?.trim() ?? "";
-    const attempts = head && head !== value ? [head, value] : [value, value.split(/\s+/)[0] ?? ""];
+    // A decline is searched by the words lists use for it; a word of one or two letters ("I") is never searched alone:
+    // it matches nearly every row, and the list may keep the row it lit up.
+    // A one-word value is also searched by its stem, which finds it in another language ("Economia" finds "Economics").
+    const stem = /^\p{L}{6,}$/u.test(value.trim()) ? value.trim().slice(0, -2) : "";
+    // A country or a language is also searched in the other language ("Italia" in a list of English names).
+    const otherWords = [toEnglish(head || value), toItalian(head || value)].filter((v) => v !== (head || value));
+    const attempts = DECLINE.test(value) ? ["prefer", "decline", "wish", "not", "non"] : [...(head && head !== value ? [head, value] : [value, value.split(/\s+/)[0] ?? "", stem]), ...otherWords];
     for (const typed of [...new Set(attempts)]) {
-      if (!typed) continue;
+      if (!typed || typed.length < 3) continue;
       // Keys go wherever the focus is. A click that did not put it in this box (the window was still coming to the front) is made good here.
       if (!(await page.awj<boolean>("hasFocus", selector)) && !(await page.awj<boolean>("focus", selector))) break;
       // A Workday prompt's search box keeps what an earlier try typed: it is emptied first. (Elsewhere a Backspace could
@@ -268,7 +320,16 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
       await page.key("Enter");
       await sleep(BROWSER.pollMs * 4);
       const picked = (await shownValues(page, [selector]))[0] ?? "";
-      if (picked && showsValue(value, picked)) return null;
+      if (picked && (showsValue(value, picked) || pickOption([picked], value, hints))) return null;
+      // Enter picks a lone match by itself, whatever it is ("Non Vedenti (Italy)" for the search "non"): a pick that
+      // does not hold the wanted value is taken off at once, and the box is opened again for the next search.
+      if (picked && !before) {
+        trace(`dropdown ${selector}: Enter picked "${picked.slice(0, 40)}" for "${value.slice(0, 40)}", taken off`);
+        await dropWrongPicks(page, selector, value);
+        await openDropdown(page, selector);
+        await waitOptions(page, selector, false);
+        continue;
+      }
       opts = await waitOptions(page, selector, true, (seen) => pickOption(seen, value, hints) !== null);
       choice = pickOption(opts, value, hints);
       if (choice) break;
@@ -277,6 +338,24 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   }
   if (!choice) {
     await closeDropdown(page);
+    // A list that was empty before is left empty: a row the search lit up is not kept as a choice nobody made.
+    if (!before && (await page.awj<boolean>("isPrompt", selector))) await dropWrongPicks(page, selector, value);
+    const now = (await shownValues(page, [selector]))[0] ?? "";
+    if (!before && now && (await page.awj<boolean>("focus", selector))) {
+      await page.awj("selectAll");
+      await page.key("Backspace");
+      await page.key("Escape");
+      await page.evaluate("window.__awj.blur()");
+      trace(`dropdown ${selector}: no option matched, "${now.slice(0, 40)}" taken off again`);
+    }
+    // A drawn list that showed no rows (inRecruiting's bootstrap-select, now and then): the real <select> behind it is picked.
+    const twin = await page.awj<string[]>("twinOptions", selector).catch(() => [] as string[]);
+    const pick = twin.length ? pickOption(twin, value, hints) : null;
+    if (pick && (await page.awj<boolean>("selectTwin", selector, pick))) {
+      await sleep(BROWSER.pollMs);
+      const shown = (await shownValues(page, [selector]))[0] ?? "";
+      if (showsValue(pick, shown)) return null;
+    }
     return `no option matches "${value}"${opts.length ? ` among: ${opts.slice(0, 12).join(" | ")}` : ""}`;
   }
   // Finding the option scrolls it into view, and a list drawn beside its box moves with the box a moment later.
@@ -296,9 +375,18 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   // nothing is picked yet and other rows are shown. The row that best fits the wanted value is taken there, a few levels deep.
   const top = choice;
   for (let depth = 0; depth < 3 && !((await shownValues(page, [selector]))[0] ?? ""); depth++) {
-    const sub = await waitOptions(page, selector, false);
+    let sub = await waitOptions(page, selector, false);
     if (!sub.length || sub.join("|") === opts.join("|")) break;
-    const next = pickOption(sub, value, hints) ?? subRow(sub, value);
+    let next = pickOption(sub, value, hints);
+    // A list inside the row that draws only the rows in view ("Italy" > "Citizen (Aruba)", "Citizen (Algeria)"…) is
+    // scrolled to the wanted row. Its first drawn row is never taken in the wanted row's place.
+    const partial = await page.awj<boolean>("listIsPartial", selector);
+    for (let i = 0; partial && !next && i < 60 && (await page.awj<boolean>("scrollList", selector)); i++) {
+      await sleep(BROWSER.pollMs);
+      sub = await page.awj<string[]>("options", selector);
+      next = pickOption(sub, value, hints);
+    }
+    if (!next && !partial) next = subRow(sub, value);
     const q = next ? await page.awj<Point>("optionPoint", selector, next) : null;
     if (!next || !q?.ok) break;
     await page.click(q.x, q.y);
@@ -309,10 +397,44 @@ async function clickAndPick(page: Page, selector: string, value: string, hints: 
   // The pick was made inside the row that was asked for: the box is marked with that row, so reading it back shows
   // "Corporate Website > Company Website" and the wanted "Corporate Website" is seen to be there.
   if (choice !== top) await page.call("function (s, under) { const el = window.__awj.q(s); if (el) el.setAttribute('data-awj-under', under); }", selector, top);
-  const shown = (await shownValues(page, [selector]))[0] ?? "";
+  let shown = (await shownValues(page, [selector]))[0] ?? "";
+  // A list that moved under the pointer as it opened (SuccessFactors draws its rows twice, then drops one copy) took the
+  // row next to the wanted one: it is opened again and the wanted row clicked once more, where it now is.
+  if (shown && choice === top && !showsValue(choice, shown) && !showsValue(value, shown)) {
+    trace(`dropdown ${selector}: "${shown.slice(0, 40)}" taken in place of "${choice}", clicking it again`);
+    await openDropdown(page, selector);
+    await waitOptions(page, selector, false);
+    await sleep(BROWSER.pollMs * 2);
+    const again = await page.awj<Point>("optionPoint", selector, choice);
+    if (again.ok) {
+      await page.click(again.x, again.y);
+      await sleep(BROWSER.pollMs * 2);
+      shown = (await shownValues(page, [selector]))[0] ?? "";
+    } else await closeDropdown(page);
+  }
   if (shown && !showsValue(choice, shown) && !showsValue(value, shown)) return `the list shows "${shown.slice(0, 40)}" after "${choice}" was clicked`;
   if (!shown && (await page.awj<boolean>("isPrompt", selector))) return `nothing was picked after "${choice}" was clicked`;
   return null;
+}
+
+/**
+ * Takes off a Workday prompt's picks that do not hold the wanted value. True when a pick holding it stays.
+ * A pick holds the value when it names it whole ("Citizen (Italy)" for Italy); the looser page check would take
+ * "Citizen (Italy)" for "Citizen (Nepal)".
+ */
+async function dropWrongPicks(page: Page, selector: string, value: string): Promise<boolean> {
+  const holds = (label: string) => norm(label) === norm(value) || norm(label).includes(norm(value)) || pickOption([label], value, []) !== null;
+  for (let i = 0; i < 6; i++) {
+    const picks = await page.awj<(Point & { label: string })[]>("promptPicks", selector);
+    const wrong = picks.find((p) => p.ok && !holds(p.label));
+    if (!wrong) return picks.some((p) => holds(p.label));
+    await page.click(wrong.x, wrong.y);
+    await sleep(BROWSER.pollMs * 3);
+    // Removing a pick opens the list; it is closed so the next click opens it afresh with the keyboard in the box.
+    await closeDropdown(page);
+    await sleep(BROWSER.pollMs * 2);
+  }
+  return false;
 }
 
 /** In a list opened from another row: the row sharing a word with the wanted value, else a general one (a website, "other"), else the first. */
@@ -331,11 +453,12 @@ function subRow(rows: string[], value: string): string | null {
  * from which the site fills in the rest). The panel is opened, the candidate's postal code is typed into its search
  * box, then the city, and the suggestion that names the candidate's places is clicked. Returns why it failed, or null.
  */
-export function fillPanel(page: Page, selector: string, searches: string[], hints: string[]): Promise<string | null> {
+export function fillPanel(page: Page, selector: string, searches: string[], hints: string[], street = ""): Promise<string | null> {
   return inFront(page, async () => {
-    const why = await panelOnce(page, selector, searches, hints);
-    // A panel left open covers the fields below it, so a failed one is closed before anything else is filled.
-    if (why && (await page.awj<unknown[]>("panelBoxes", selector)).length) {
+    const why = await panelOnce(page, selector, searches, hints, street);
+    // A panel left open covers the fields below it, filled or not: the next field's click would land in its lists
+    // (the country list's first row, "Andorra"). So it is closed before anything else is filled.
+    if ((await page.awj<unknown[]>("panelBoxes", selector)).length) {
       await page.key("Escape");
       if ((await page.awj<unknown[]>("panelBoxes", selector)).length) {
         const p = await page.awj<Point>("point", selector);
@@ -346,7 +469,7 @@ export function fillPanel(page: Page, selector: string, searches: string[], hint
   });
 }
 
-async function panelOnce(page: Page, selector: string, searches: string[], hints: string[]): Promise<string | null> {
+async function panelOnce(page: Page, selector: string, searches: string[], hints: string[], street: string): Promise<string | null> {
   {
     const p = await page.awj<Point>("point", selector);
     if (!p.ok) return "control not found";
@@ -367,19 +490,23 @@ async function panelOnce(page: Page, selector: string, searches: string[], hints
     }
     // A panel that starts with an empty country keeps its other boxes switched off until one is picked.
     const country = await page.awj<{ selector: string; label: string; value: string } | null>("panelCountry", selector);
-    if (country && !country.value && country.label) {
-      const name = hints[hints.length - 1] ?? "";
-      if (name && (await page.awj<boolean>("focus", country.selector))) {
-        // The first letters find the country in any language the list is written in: "Ital" is Italia, Italy, Italien.
-        const typed = name.slice(0, 4);
-        await page.typeKeys(typed);
-        let row: (Point & { label: string }) | undefined;
+    // The first letters find the country in any language the list is written in: "Ital" is Italia, Italy, Italien.
+    const countryName = hints[hints.length - 1] ?? "";
+    const countryStart = countryName.slice(0, 4);
+    // A country the panel set by itself (the list's first, "Andorra") is as good as none.
+    if (country && country.label && countryStart && !norm(country.value).startsWith(norm(countryStart))) {
+      if (await page.awj<boolean>("focus", country.selector)) {
+        await page.evaluate("window.__awj.selectAll()");
+        await page.key("Backspace");
+        await page.typeKeys(countryStart);
+        let label: string | undefined;
         const until = Date.now() + BROWSER.optionsMs;
-        while (!row && Date.now() < until) {
+        while (!label && Date.now() < until) {
           await sleep(BROWSER.pollMs * 2);
-          row = (await page.awj<(Point & { label: string })[]>("suggestions", typed)).find((r) => r.ok && norm(r.label).startsWith(norm(typed)));
+          label = (await page.awj<(Point & { label: string })[]>("suggestions", countryStart)).find((r) => r.ok && norm(r.label).startsWith(norm(countryStart)))?.label;
         }
-        if (row) {
+        const row = label ? await page.awj<Point & { label: string }>("suggestionPoint", countryStart, label) : undefined;
+        if (row?.ok) {
           await page.click(row.x, row.y);
           await sleep(BROWSER.pollMs * 3);
         }
@@ -410,13 +537,40 @@ async function panelOnce(page: Page, selector: string, searches: string[], hints
         rows = await page.awj("suggestions", typed);
         choice = pickOption(rows.map((r) => r.label), typed, hints);
       }
-      const row = choice ? (await page.awj<(Point & { label: string })[]>("suggestions", typed)).find((r) => r.label === choice) : undefined;
+      const row = choice ? await page.awj<Point & { label: string }>("suggestionPoint", typed, choice) : undefined;
       if (!row?.ok) continue;
       await page.click(row.x, row.y);
       await sleep(BROWSER.pollMs * 3);
-      if (await page.awj<string>("shown", selector)) return null;
+      // Only an address naming what was searched counts: a country alone, or another town, is not the candidate's.
+      const shown = norm(await page.awj<string>("shown", selector));
+      if (searches.some((x) => x && shown.includes(norm(x)))) {
+        await streetInPanel(page, selector, street);
+        return null;
+      }
+      trace(`panel ${selector}: "${choice}" was clicked, the panel shows "${shown.slice(0, 60)}"`);
     }
     return `no suggestion matched ${searches.filter(Boolean).join(" or ")}`;
+  }
+}
+
+/**
+ * A panel that wants the full address (inRecruiting's "Indirizzo di residenza") draws a street box and a house-number
+ * box once the town is picked, and refuses the address without them. Empty ones get the candidate's street and number.
+ */
+async function streetInPanel(page: Page, selector: string, street: string): Promise<void> {
+  if (!street) return;
+  await sleep(BROWSER.pollMs * 3);
+  const boxes = await page.awj<{ selector: string; label: string; value: string }[]>("panelBoxes", selector);
+  const m = /^(.*?)[,\s]+(\d+[a-z]?(\/\d+)?)\s*$/i.exec(street.trim());
+  const [road, number] = m ? [m[1]!.trim(), m[2]!] : [street.trim(), ""];
+  const NUMBER = /\b(civico|n\.?\s*civ|numero|number|house ?n|hausnummer|num[eé]ro)\b/i;
+  const ROAD = /\b(indirizzo|via|street|address|strada|stra(ss|ß)e|rue|calle|direcci[oó]n)\b/i;
+  for (const b of boxes.filter((x) => !x.value)) {
+    const value = NUMBER.test(b.label) ? number : ROAD.test(b.label) ? road : "";
+    if (!value || !(await page.awj<boolean>("focus", b.selector))) continue;
+    await page.typeKeys(value);
+    await page.key("Tab");
+    trace(`panel ${selector}: "${b.label}" typed "${value}"`);
   }
 }
 

@@ -4,7 +4,7 @@
  * the writer is escaped before it reaches the page.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { BROWSER, DOCUMENTS, PATHS } from "../config.js";
 import type { QueueEntry } from "../jobs/queue.js";
@@ -99,14 +99,33 @@ export const pdfPages = (pdf: Buffer) => Math.max(1, (pdf.toString("latin1").mat
  * Prints an HTML document to a PDF file and returns its page count. A headless Chrome of its own
  * does the printing: the runner's window cannot print, and nothing else needs installing. The
  * HTML is written next to the PDF while Chrome reads it, then removed.
+ *
+ * Prints run one at a time: two Chromes on the one print profile clash, and the second wrote nothing ("printing
+ * failed"). The PDF is printed under a temporary name and takes the file's place only once whole, so a print that
+ * fails never removes the document already there (a job's resume was lost when its letter was added). A failed
+ * print is tried once more.
  */
-export async function printPdf(html: string, outFile: string): Promise<number> {
+let printing: Promise<unknown> = Promise.resolve();
+export function printPdf(html: string, outFile: string): Promise<number> {
+  const run = printing.then(async () => {
+    try {
+      return await printOnce(html, outFile);
+    } catch {
+      return await printOnce(html, outFile);
+    }
+  });
+  printing = run.catch(() => undefined);
+  return run;
+}
+
+async function printOnce(html: string, outFile: string): Promise<number> {
   const htmlFile = outFile.replace(/\.pdf$/, "") + ".html";
+  const partFile = outFile.replace(/\.pdf$/, "") + ".part.pdf";
   writeFileSync(htmlFile, html);
-  if (existsSync(outFile)) unlinkSync(outFile);
+  if (existsSync(partFile)) unlinkSync(partFile);
   // Chrome writes the PDF and may then linger, so the file is watched and Chrome is stopped once it is whole.
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(BROWSER.chromePath, ["--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run", "--no-pdf-header-footer", `--print-to-pdf=${outFile}`, `--user-data-dir=${path.join(PATHS.runs, "print-profile")}`, `file://${htmlFile}`], { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(BROWSER.chromePath, ["--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run", "--no-pdf-header-footer", `--print-to-pdf=${partFile}`, `--user-data-dir=${path.join(PATHS.runs, "print-profile")}`, `file://${htmlFile}`], { stdio: ["ignore", "ignore", "pipe"] });
     let err = "";
     let done = false;
     const finish = (fail?: Error) => {
@@ -120,8 +139,8 @@ export async function printPdf(html: string, outFile: string): Promise<number> {
     };
     let lastSize = -1;
     const poll = setInterval(() => {
-      if (!existsSync(outFile)) return;
-      const size = statSync(outFile).size;
+      if (!existsSync(partFile)) return;
+      const size = statSync(partFile).size;
       if (size > 0 && size === lastSize) finish();
       lastSize = size;
     }, 200);
@@ -129,10 +148,11 @@ export async function printPdf(html: string, outFile: string): Promise<number> {
     child.stderr.on("data", (d: Buffer) => (err += d.toString()));
     child.on("error", (e) => finish(new Error(`could not run Chrome to print: ${e.message}`)));
     child.on("close", () => {
-      if (existsSync(outFile) && statSync(outFile).size > 0) finish();
+      if (existsSync(partFile) && statSync(partFile).size > 0) finish();
       else finish(new Error(`printing failed${err ? `: ${err.trim().split("\n").pop()?.slice(0, 160)}` : ""}`));
     });
   });
   unlinkSync(htmlFile);
+  renameSync(partFile, outFile);
   return pdfPages(readFileSync(outFile));
 }

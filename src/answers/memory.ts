@@ -144,10 +144,13 @@ export function fits(value: string, f: OpenField): string | null {
   return f.maxLength === null || value.length <= f.maxLength ? value : null;
 }
 
-/** The whole resolution of this form from last time, when the candidate's context and the open fields are both unchanged. */
+/**
+ * The whole resolution of this form from last time, when the candidate's context and the open fields are both
+ * unchanged. A "needs review" is not taken again: what held the form (a resume box left empty) may be settled now.
+ */
 export function recallForm(mem: MemoryFile, jobId: string, fingerprint: string, open: OpenField[]): Resolution | null {
   const m = mem.forms[jobId];
-  return m && m.fingerprint === fingerprint && m.openKey === openKey(open) ? m.resolution : null;
+  return m && m.fingerprint === fingerprint && m.openKey === openKey(open) && m.resolution.verdict !== "needs_review" ? m.resolution : null;
 }
 
 /**

@@ -11,7 +11,7 @@ import { z } from "zod";
 import { DOCUMENTS, PATHS, WRITER } from "../config.js";
 import { candidateContext, contextFingerprint, runWriter } from "../answers/resolve.js";
 import { jobContext } from "../answers/context.js";
-import type { QueueEntry } from "../jobs/queue.js";
+import { loadQueue, type QueueEntry } from "../jobs/queue.js";
 import type { Profile } from "../profile/schema.js";
 import { hashOf } from "../util/cache.js";
 import { coverHtml, prettyMonth, printPdf, resumeHtml } from "./render.js";
@@ -22,15 +22,59 @@ export const Tailored = z.object({
   /** Two or three sentences, written for this posting. */
   summary: z.string().min(40).max(900),
   /** The skills that matter for this posting, most relevant first, each one taken from the profile. A longer list is cut, not refused. */
-  skills: z.array(z.string().min(1).max(60)).min(3).transform((a) => a.slice(0, DOCUMENTS.maxSkills)),
+  skills: z.array(z.preprocess((k) => (typeof k === "string" ? shortSkill(k) : k), z.string().min(1).max(60))).min(3).transform((a) => a.slice(0, DOCUMENTS.maxSkills)),
   /** The profile's jobs, with the bullets that matter for this posting, in the profile's own words. */
   experience: z.array(z.object({ company: z.string(), title: z.string(), bullets: z.array(z.string().min(10).max(400)).min(1).transform((b) => b.slice(0, DOCUMENTS.maxBullets)) })).min(1),
   projects: z.array(z.object({ name: z.string(), bullets: z.array(z.string().min(10).max(400)).min(1).transform((b) => b.slice(0, DOCUMENTS.maxBullets)) })).default([]),
-  coverLetter: z.object({ greeting: z.string().max(80), paragraphs: z.array(z.string().min(40).max(1200)).min(2).transform((p) => p.slice(0, 5)), closing: z.string().max(80) }).optional(),
+  /** A writer may send null when no letter was asked: that is no letter, not a broken draft. A letter sent as
+   *  one plain text is split into its greeting, paragraphs and closing rather than thrown away; paragraphs too short
+   *  to stand alone are joined. A letter that still does not fit is no letter: the resume is kept, never lost with it. */
+  coverLetter: z.preprocess((c) => (typeof c === "string" ? letterFromText(c) : isLetter(c) ? { ...c, paragraphs: paragraphsFrom(c.paragraphs) } : c), z.object({ greeting: z.string().max(80), paragraphs: z.array(z.string().min(40).max(1200)).min(1).transform((p) => p.slice(0, 5)), closing: z.string().max(80) }).nullish()).catch(undefined).transform((c) => c ?? undefined),
   /** The posting's keywords the resume now carries, and the ones the profile cannot support. */
   keywordsCovered: z.array(z.string()).default([]),
   keywordsMissing: z.array(z.string()).default([]),
 });
+
+/** A letter written as one text: a short first line ending in a comma is the greeting, a short last line the
+ *  closing, the blocks between are the paragraphs (a block too short to stand alone joins the next one). */
+function letterFromText(text: string): unknown {
+  const blocks = text.split(/\n\s*\n|\r?\n/).map((b) => b.replace(/\s+/g, " ").trim()).filter(Boolean);
+  if (blocks.length === 0) return null;
+  const first = blocks[0] ?? "";
+  const greeting = blocks.length > 2 && first.length <= 80 && /[,:]$/.test(first) ? (blocks.shift() ?? "") : "";
+  let closing = "";
+  const lastLength = () => (blocks[blocks.length - 1] ?? "").length;
+  while (blocks.length > 2 && lastLength() < 40 && closing.length + lastLength() < 80) closing = `${blocks.pop()} ${closing}`.trim();
+  return { greeting, paragraphs: paragraphsFrom(blocks), closing };
+}
+
+const isLetter = (c: unknown): c is { paragraphs: unknown[] } => !!c && typeof c === "object" && Array.isArray((c as { paragraphs?: unknown }).paragraphs);
+
+/** A skill written as a phrase longer than the box takes is cut at a word, not refused. */
+function shortSkill(k: string): string {
+  const t = k.replace(/\s+/g, " ").trim();
+  if (t.length <= 60) return t;
+  const cut = t.slice(0, 60);
+  return (cut.lastIndexOf(" ") > 20 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).replace(/[\s,;:(–-]+$/, "");
+}
+
+/** Blocks too short to stand alone join the next one; a single block is split in two at a sentence. */
+function paragraphsFrom(blocks: unknown[]): string[] {
+  const paragraphs: string[] = [];
+  for (const b of blocks.filter((x): x is string => typeof x === "string").map((x) => x.replace(/\s+/g, " ").trim()).filter(Boolean)) {
+    const last = paragraphs[paragraphs.length - 1];
+    if (last !== undefined && last.length < 40) paragraphs[paragraphs.length - 1] = `${last} ${b}`;
+    else paragraphs.push(b);
+  }
+  const only = paragraphs.length === 1 ? paragraphs[0] : undefined;
+  if (only !== undefined) {
+    const sentences = only.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) ?? [only];
+    const half = Math.ceil(sentences.length / 2);
+    const [one, two] = [sentences.slice(0, half).join("").trim(), sentences.slice(half).join("").trim()];
+    if (one.length >= 40 && two.length >= 40) paragraphs.splice(0, 1, one, two);
+  }
+  return paragraphs;
+}
 export type Tailored = z.infer<typeof Tailored>;
 
 export type Documents = { dir: string; resume: string; cover: string | null; coverText: string | null; json: string };
@@ -166,6 +210,29 @@ const parse = (text: string): Tailored => {
 const inflight = new Map<string, Promise<Documents & { tailored: Tailored; reused: boolean }>>();
 
 /** One job's documents are written once at a time: a second call while the first is running joins it. */
+/**
+ * The resume a job's form may see. With tailoring on, only the one written for this job: the profile's own file is
+ * never shown to a site, not even to read it into the form. A draft that fails is written once more from scratch; a
+ * second failure is a reason not to apply, given back as text. With tailoring off, the profile's own file.
+ */
+export async function resumeFor(profile: Profile, jobId: string): Promise<{ resume: string } | { why: string }> {
+  if (!policy.resume) return { resume: profile.resume.path };
+  const have = documentsFor(jobId, profile);
+  if (have) return { resume: have.resume };
+  const entry = loadQueue().entries.find((e) => e.job.id === jobId);
+  if (!entry) return { why: "the resume for this job could not be written: the job is not in the queue" };
+  let last = "";
+  for (const fresh of [false, true]) {
+    try {
+      return { resume: (await tailorJob(profile, entry, { cover: false, fresh })).resume };
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+      console.log(`   the resume for this job was not written${fresh ? " again" : ""}: ${last}`);
+    }
+  }
+  return { why: `the resume for this job could not be written: ${last.slice(0, 160)}` };
+}
+
 export function tailorJob(profile: Profile, entry: QueueEntry, opts: { cover: boolean; fresh?: boolean }): Promise<Documents & { tailored: Tailored; reused: boolean }> {
   const running = inflight.get(entry.job.id);
   if (running && !opts.fresh) return running;

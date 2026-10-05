@@ -134,6 +134,8 @@ export const ProfileSchema = z.object({
   }),
   /** An academic transcript, attached only to a file box that asks for one. Leave it out and such a form is held for you. */
   transcript: z.object({ path: z.string() }).optional(),
+  /** A photo of the candidate, attached to any box that asks for one. Leave it out and a form that requires one is held. */
+  photo: z.object({ path: z.string() }).optional(),
   /** Three or four sentences used as the candidate side of every JEV rating call. */
   summary: z.string().min(40),
   /** Short facts Claude may use when drafting free text. Nothing outside this list is claimed. */

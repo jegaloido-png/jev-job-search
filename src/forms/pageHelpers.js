@@ -252,6 +252,36 @@
       const select2 = el.tagName === "SELECT" && /select2-hidden/.test(el.className) && el.nextElementSibling;
       return !el.disabled && (el.type === "file" || visible(el) || visible(control(el)) || (label && visible(label)) || (select2 && visible(select2))) ? "on" : "off";
     },
+    /** The options of the real <select> a drawn list button stands for (bootstrap-select draws its rows only once opened). */
+    twinOptions(sel) {
+      const el = q(sel);
+      const s = el && el.parentElement && el.parentElement.querySelector(":scope > select");
+      return s ? [...s.options].map((o) => o.text.trim()).filter((t) => t && !/^(seleziona|select|choose|scegli|no selection|nessuna selezione)\b/i.test(t)) : [];
+    },
+    /** Picks an option of that real <select> by its words and tells the page, the way its own list would. */
+    selectTwin(sel, label) {
+      const el = q(sel);
+      const s = el && el.parentElement && el.parentElement.querySelector(":scope > select");
+      const o = s && [...s.options].find((x) => x.text.trim() === label);
+      if (!o) return false;
+      if (s.multiple) [...s.options].forEach((x) => (x.selected = x === o));
+      else s.value = o.value;
+      s.dispatchEvent(new Event("change", { bubbles: true }));
+      const $ = window.jQuery;
+      if ($ && $.fn && $.fn.selectpicker) { try { $(s).selectpicker("refresh"); $(s).trigger("changed.bs.select"); } catch (e) {} }
+      return true;
+    },
+    /**
+     * True for a text box with a suggestion list beside it whose picked value lives in an empty hidden box next to it
+     * (Lever's location: "selectedLocation"). Words in the box are not a pick: a resume autofill writes them there too.
+     */
+    pickPending(sel) {
+      const el = q(sel);
+      const field = el && el.tagName === "INPUT" && el.parentElement;
+      if (!field || !field.querySelector('[class*="dropdown-results" i], [class*="autocomplete" i], [class*="typeahead" i], [class*="suggestions" i]')) return false;
+      const hidden = [...field.querySelectorAll("input[type=hidden]")];
+      return hidden.length > 0 && hidden.every((h) => !h.value);
+    },
     /** True when keyboard input would land in this control right now. */
     hasFocus(sel) {
       const el = q(sel);
@@ -273,7 +303,9 @@
       if (a && typeof a.select === "function") a.select();
     },
     options(sel) {
-      return optionEls(sel).map(text);
+      // The row an empty search shows ("No Items.", "Nessun risultato") is a message, not a choice.
+      const empty = /^(no (items|results?|matches|options|data|selection)( found)?|nessuna selezione|keine auswahl|aucune sélection|sin selección|nenhuma seleção|nothing found|nessun (risultato|elemento)|nessuna corrispondenza|keine (ergebnisse|einträge|treffer)|aucun (résultat|élément)|sin resultados|nenhum resultado)\.?$/i;
+      return optionEls(sel).map(text).filter((t) => !empty.test(t.trim()));
     },
     /**
      * Empties the search box inside a list's own menu (Teamtailor's "Cerca"), so the whole list shows again after an
@@ -435,6 +467,8 @@
       let root = el.parentElement;
       while (root && root.querySelectorAll("input:not([type=hidden])").length < 2) root = root.parentElement;
       if (!root) return [];
+      // Marks left on an earlier panel's boxes (Domicilio before Residenza) would send the typing there.
+      document.querySelectorAll("[data-awj-panel]").forEach((n) => { if (!root.contains(n)) n.removeAttribute("data-awj-panel"); });
       const own = el.querySelector("input");
       return [...root.querySelectorAll("input:not([type=hidden])")]
         .filter((b) => b !== own && visible(b) && !b.disabled && !b.readOnly && (b.type || "text") === "text")
@@ -456,12 +490,59 @@
       q(box.selector).setAttribute("data-awj-panel", "country");
       return { ...box, selector: '[data-awj-panel="country"]' };
     },
-    /** The suggestions on the page that name the typed text, with where to click each. */
-    suggestions(typed) {
+    /**
+     * The suggestions on the page that name the typed text, nearest the box being typed in first: a list drawn
+     * under the box comes before the page's own menus ("Italiano" in the language switch for "Ital").
+     */
+    suggestionRows(typed) {
       const want = typed.toLowerCase();
+      const at = document.activeElement && document.activeElement !== document.body ? document.activeElement.getBoundingClientRect() : null;
+      const far = (o) => {
+        if (!at) return 0;
+        const r = o.getBoundingClientRect();
+        return Math.hypot(r.left + r.width / 2 - (at.left + at.width / 2), r.top + r.height / 2 - (at.top + at.height / 2));
+      };
       const rows = deepAll('[role=option], li, .dropdown-item, [class*="option" i], [class*="suggest" i] > *')
         .filter((o) => visible(o) && o.children.length <= 3 && text(o).toLowerCase().includes(want) && text(o).length < 120);
-      return rows.slice(0, 20).map((o) => ({ label: text(o), ...center(o) }));
+      // Rows of one list keep their order; lists are ordered by how near their first row is to the box.
+      const lists = new Map();
+      for (const o of rows) {
+        const key = o.parentElement;
+        if (!lists.has(key)) lists.set(key, []);
+        lists.get(key).push(o);
+      }
+      return [...lists.values()].sort((a, b) => far(a[0]) - far(b[0])).flat().slice(0, 20);
+    },
+    /**
+     * The suggestions with where each stands. Nothing is scrolled while reading: scrolling each row into view
+     * moves the list under the earlier ones, so a click would land on another row ("Mola di Bari" for "Bari").
+     */
+    suggestions(typed) {
+      return window.__awj.suggestionRows(typed).map((o) => {
+        const r = o.getBoundingClientRect();
+        return { label: text(o), x: r.left + r.width / 2, y: r.top + r.height / 2, ok: r.width > 0 && r.height > 0 };
+      });
+    },
+    /**
+     * Sets a slider to the number in the value ("25.000 EUR" is 25000, "6 mesi" is 6), kept within its ends and steps,
+     * the way the site's own script hears a drag. Returns the value it shows, or null when the box is no slider.
+     */
+    setRange(sel, value) {
+      const el = q(sel);
+      if (!el || el.type !== "range") return null;
+      const digits = String(value).replace(/[.\s'](?=\d{3}\b)/g, "").replace(",", ".").match(/\d+(\.\d+)?/);
+      if (!digits) return el.value;
+      const min = Number(el.min || 0), max = Number(el.max || 100), step = Number(el.step) || 1;
+      const n = Math.min(max, Math.max(min, min + Math.round((Number(digits[0]) - min) / step) * step));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, String(n));
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return el.value;
+    },
+    /** One suggestion, scrolled into view just before it is clicked, with where to click it. */
+    suggestionPoint(typed, label) {
+      const o = window.__awj.suggestionRows(typed).find((r) => text(r) === label);
+      return o ? { label, ...center(o) } : { label, x: 0, y: 0, ok: false };
     },
     /** True when the page shows this file name, which is how an accepted upload looks once the input is replaced. */
     /**
@@ -543,7 +624,7 @@
     /** A button inside an open dialog whose words match, so a dialog's own "Done" is pressed and not a look-alike on the page. */
     dialogButton(pattern) {
       const re = new RegExp(pattern, "i");
-      const dialogs = [...document.querySelectorAll("[role=dialog], [aria-modal=true], .cdk-overlay-container, .modal, [class*=dialog i]")].filter(visible);
+      const dialogs = [...document.querySelectorAll("dialog[open], [role=dialog], [aria-modal=true], .cdk-overlay-container, .modal, [class*=dialog i]")].filter(visible);
       for (const d of dialogs) {
         const b = [...d.querySelectorAll("button, [role=button]")].find((x) => visible(x) && re.test(text(x)));
         if (b) return { ...center(b), ok: true };
@@ -557,7 +638,17 @@
       if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     },
     errors() {
-      return deepAll('[aria-invalid="true"], [class*="error" i], [data-automation-id*="error" i]').filter(visible).map(text).filter((t) => t && t.length < 200).slice(0, 20);
+      const words = deepAll('[aria-invalid="true"], [class*="error" i], [data-automation-id*="error" i]').filter(visible).map(text).filter((t) => t && t.length < 200);
+      // A message that names no field ("one or more required fields above hasn't been completed"): the boxes the page
+      // itself holds invalid are named too. A file box is often kept out of sight behind its button. Only with a message
+      // shown: an untouched form is often invalid, and that is no error.
+      if (!words.length) return words;
+      const bad = deepAll("input, select, textarea").filter((el) => el.type !== "hidden" && (el.matches(":invalid") || el.classList.contains("ng-invalid") || el.getAttribute("aria-invalid") === "true") && (visible(el) || el.type === "file"));
+      const named = bad.map((el) => {
+        const l = (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)) || el.closest("label");
+        return `invalid: ${((l && text(l)) || el.getAttribute("aria-label") || el.name || el.id || el.type).slice(0, 60)}${el.type === "file" ? ` (file, ${el.files ? el.files.length : 0} attached)` : ""}`;
+      });
+      return [...words, ...named].slice(0, 20);
     },
     pageText() {
       if (!document.body) return "";
@@ -571,12 +662,17 @@
      */
     entryAdds() {
       const ADD = /^\s*\+?\s*(add|aggiungi|hinzufügen|ajouter|añadir|agregar|adicionar|toevoegen)\s*$/i;
-      const MISSING = /\b(at least one|almeno una?|mindestens (ein|eine)|au moins une?|al menos una?|pelo menos uma?)\b/i;
+      // "Add Education", "Aggiungi esperienza": the Add of an entry section names it; a file or a link is not an entry.
+      const ADD_NAMED = /^\s*\+?\s*(add|aggiungi|ajouter|añadir|agregar|adicionar)( (a|an|another|new|un|una|un'|nuova?|altra?|otro|otra))? [\p{L} ]{3,30}$/iu;
+      const NOT_ENTRY = /file|attach|allegat|document|upload|link|url|photo|foto|cover|lettera|resume|\bcv\b|curriculum/i;
+      const isAdd = (w) => ADD.test(w) || (ADD_NAMED.test(w) && !NOT_ENTRY.test(w));
+      // Or the page's own error under the section ("This field is required.", Manatal after another entry's Save).
+      const MISSING = /\b(at least one|almeno una?|mindestens (ein|eine)|au moins une?|al menos una?|pelo menos uma?|field is required|campo (è )?obbligatorio|champ (est )?obligatoire|pflichtfeld|campo (es )?obligatorio)\b/i;
       const out = [];
       const seen = new Set();
       for (const b of deepAll("button, [role=button]")) {
         const own = buttonWords(b);
-        if (!visible(b) || !ADD.test(own)) continue;
+        if (!visible(b) || !isAdd(own)) continue;
         // A web component's inner button and its host are one button.
         const host = b.getRootNode() instanceof ShadowRoot ? b.getRootNode().host : b;
         if (seen.has(host)) continue;
@@ -593,13 +689,13 @@
           if (!header) {
             const rest = said.replace(own, "").trim();
             if (rest === "") continue;
-            if (/^.{1,60}[*✱]$/.test(rest)) { header = said; continue; }
+            if (/^.{1,140}[*✱]$/.test(rest)) { header = said; continue; }
             break;
           }
           if (said === header) continue;
           // The first box around the heading that holds more: the section's saved entries, or, past an empty section,
           // the rest of the form (fields to fill, other sections' Add buttons).
-          const beyond = deepAll("input:not([type=hidden]), select, textarea", box).some(visible) || deepAll("button, [role=button]", box).filter((x) => visible(x) && ADD.test(buttonWords(x))).length > 1;
+          const beyond = deepAll("input:not([type=hidden]), select, textarea", box).some(visible) || deepAll("button, [role=button]", box).filter((x) => visible(x) && isAdd(buttonWords(x))).length > 1;
           wants = beyond || said.replace(header, "").trim() === "";
           break;
         }
@@ -640,6 +736,8 @@
         for (const seg of u.pathname.split("/")) if (re.test(seg)) out.push(`address path ${seg.slice(0, 60)}`);
         if (re.test(u.hash)) out.push(`address ${u.hash.slice(0, 60)}`);
       } catch {}
+      // A page caught between two documents has no body yet: its address is all there is to read.
+      if (!document.body) return out;
       const colour = /^(btn|text|bg|border|badge|label|has|is|fa|icon)[-_]/i;
       for (const el of deepAll("[id], [class]").filter((x) => document.body.contains(x.getRootNode() instanceof ShadowRoot ? x.getRootNode().host : x))) {
         if (out.length >= 8) break;
@@ -658,7 +756,9 @@
       const words = (el) => [el.name, el.id, el.placeholder, el.getAttribute("aria-label"), el.getAttribute("autocomplete"), ...(el.labels ? [...el.labels].map((l) => text(l)) : [])].filter(Boolean).join(" ");
       const boxes = deepAll("input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]):not([type=email])").filter((el) => visible(el) && !el.disabled && !el.readOnly && !el.value);
       const singles = boxes.filter((el) => el.maxLength === 1);
-      const found = singles.length >= 4 ? singles : boxes.filter((el) => re.test(words(el)) || el.getAttribute("autocomplete") === "one-time-code").slice(0, 1);
+      // A masked passcode box the account step found (accountBoxes) comes first.
+      const marked = boxes.filter((el) => el.hasAttribute("data-awj-passcode")).slice(0, 1);
+      const found = marked.length ? marked : singles.length >= 4 ? singles : boxes.filter((el) => re.test(words(el)) || el.getAttribute("autocomplete") === "one-time-code").slice(0, 1);
       found.forEach((el, i) => el.setAttribute("data-awj-code", String(i)));
       return found.length;
     },
@@ -672,23 +772,50 @@
         el.removeAttribute("data-awj-pw");
         el.removeAttribute("data-awj-user");
       });
-      const pws = deepAll("input[type=password]").filter((el) => visible(el) && !el.disabled);
-      pws.forEach((el, i) => el.setAttribute("data-awj-pw", String(i)));
       const words = (el) => [el.name, el.id, el.placeholder, el.getAttribute("aria-label"), el.getAttribute("autocomplete"), el.getAttribute("data-automation-id"), ...(el.labels ? [...el.labels].map((l) => text(l)) : [])].filter(Boolean).join(" ");
+      deepAll("[data-awj-passcode]").forEach((el) => el.removeAttribute("data-awj-passcode"));
+      const shown = deepAll("input[type=password]").filter((el) => visible(el) && !el.disabled);
+      // A masked box for a mailed passcode is not a password box (SuccessFactors draws it in a dialog over the sign-up
+      // form once the account is made): named for a code, or the one box inside an open dialog while the others are not.
+      const inDialog = (el) => !!el.closest("[role=dialog], [aria-modal=true], .modal, .ui-dialog, dialog");
+      const codes = shown.filter((el) => !el.value && (/pass ?code|one-?time|\botp\b|verification|verifica|codice|\bcode\b|\bpin\b/i.test(words(el)) || (inDialog(el) && shown.some((o) => o !== el && !inDialog(o)))));
+      codes.forEach((el) => el.setAttribute("data-awj-passcode", "1"));
+      const pws = shown.filter((el) => !codes.includes(el));
+      pws.forEach((el, i) => el.setAttribute("data-awj-pw", String(i)));
       const typed = "input:not([type=hidden]):not([type=password]):not([type=checkbox]):not([type=radio]):not([type=file]):not([type=submit]):not([type=button])";
       const isUser = (el) => visible(el) && !el.disabled && !/robot|beecatcher|honeypot/i.test(words(el)) && (el.type === "email" || /e-?mail|user|login|utente|benutzer|courriel|correo/i.test(words(el)));
       const form = pws[0] && pws[0].closest("form");
       const user = (form && deepAll(typed, form).find(isUser)) || deepAll(typed).find(isUser);
       if (user) user.setAttribute("data-awj-user", "1");
-      return { passwords: pws.length, user: !!user, userValue: user ? user.value : "" };
+      // A page that holds both forms (SuccessFactors: "Already registered? Sign in" opens beside the sign-up): the sign-in
+      // is the password box that sits alone with an address box, the sign-up's two boxes being together.
+      let signIn = -1;
+      deepAll("[data-awj-signin-user]").forEach((el) => el.removeAttribute("data-awj-signin-user"));
+      if (pws.length >= 3) {
+        pws.forEach((el, i) => {
+          if (signIn >= 0) return;
+          for (let box = el, k = 0; box && k < 8; k++) {
+            box = up(box);
+            if (!box || deepAll("input[type=password]", box).filter(visible).length > 1) break;
+            const u = deepAll(typed, box).find(isUser);
+            if (u) {
+              signIn = i;
+              u.setAttribute("data-awj-signin-user", "1");
+              break;
+            }
+          }
+        });
+      }
+      return { passwords: pws.length, user: !!user, userValue: user ? user.value : "", signIn, passcode: codes.length };
     },
     /**
      * A button or link near the sign-in boxes whose words match: the nearest one around the password box (or the email
      * box), so a page header's own "Sign In" is never taken for the form's. The whole page when none is near.
      */
-    nearButton(pattern) {
+    nearButton(pattern, from) {
       const re = new RegExp(pattern, "i");
-      const anchor = deepAll("input[type=password]").find(visible) || q("[data-awj-user]") || deepAll("input[type=email]").find(visible);
+      // `from`: the box to start from (a passcode box in a dialog over the sign-up form), else the first password box.
+      const anchor = (from && deepAll(from).find(visible)) || deepAll("input[type=password]").find(visible) || q("[data-awj-user]") || deepAll("input[type=email]").find(visible);
       const words = (x) => (text(x) || x.value || x.getAttribute("aria-label") || "").trim();
       const pool = (root) => deepAll("a, button, [role=button], input[type=submit], input[type=button]", root).filter((x) => visible(x) && re.test(words(x)));
       const found = (hit) => {
@@ -736,6 +863,11 @@
       // A link that wraps over two lines has its middle between them: the click goes on its first line of words.
       el.scrollIntoView({ block: "center", behavior: "instant" });
       const r = el.getClientRects()[0] || el.getBoundingClientRect();
+      // A link the page does not scroll into view (a sign-up layer taller than the window) is clicked from script.
+      if (r.top < 0 || r.bottom > innerHeight) {
+        el.click();
+        return { x: 0, y: 0, ok: true, clicked: true };
+      }
       return { x: r.left + Math.min(20, r.width / 2), y: r.top + r.height / 2, ok: r.width > 0 && r.height > 0 };
     },
     /** The size an open list says it has (aria-setsize on its rows), 0 when it says nothing. */

@@ -162,7 +162,7 @@ export const RECENCY_FLOOR = 0.7;
 
 export const FORM = {
   /** Part of every cached plan's key: raised when the planning rules change, so old plans are not reused. */
-  planVersion: 17,
+  planVersion: 47,
   /** Most sections filled one entry at a time (Experience, Education) that are given an entry on one page. */
   maxEntrySections: 4,
   /** JEV confidence at or above which a mapping is applied without note. */
@@ -175,8 +175,8 @@ export const FORM = {
   maxOptionsSecondLook: 150,
   /** How many times a page is read again after a fill, for questions that only appear once another is answered. */
   followUpRounds: 3,
-  /** The most optional fields that may be left blank because they could not be set. More than this means the fill itself went wrong, and the form is held. */
-  maxLeftBlank: 2,
+  /** How long a site that read the uploaded resume gets to draw the entries it found, before the last look. */
+  resumeReadWaitMs: 5_000,
   /** Fields per JEV call. Larger forms are split into several calls. */
   fieldsPerCall: 40,
 } as const;
@@ -381,11 +381,15 @@ export const RUN = {
    * close, next. That is the cleanest to watch and the fastest per form, because no tab waits for the
    * window; the documents for the next job are written while this one is being filled.
    */
-  fillConcurrency: 1,
+  fillConcurrency: 3,
   /** Of those, how many may be on the same site at once, and the pause between opening two forms there. Job boards throttle bursts. */
   perHostConcurrency: 1,
-  /** Sites that save every field to their server as it changes, and rate-limit bursts: one form at a time, with a longer pause. */
-  gentleHosts: ["ashbyhq.com"],
+  /**
+   * Sites that save every field to their server as it changes, and rate-limit bursts: one form at a time, with a longer
+   * pause. "successfactors" is every SuccessFactors host (the pace key): companies share a host and its session cookie,
+   * so a second form opened there signs the first one out before its Submit.
+   */
+  gentleHosts: ["ashbyhq.com", "successfactors"],
   gentleGapMs: 3_000,
   /** The pause before a submission to a site that has answered a burst with an emailed code before. */
   submitGapAfterCodeMs: 15_000,

@@ -22,6 +22,7 @@ import type { Job } from "../jobs/normalize.js";
 import type { DumpedField, FieldsDump, FillPlan, PlannedField } from "./fields.js";
 import { documentPolicy, documentsFor, tailorJob } from "../documents/tailor.js";
 import { loadQueue } from "../jobs/queue.js";
+import { toItalian } from "./localWords.js";
 
 const NONE = "__none__";
 
@@ -151,7 +152,58 @@ export function hasChoosableOptions(f: DumpedField): boolean {
 
 const SALARY_LABEL = /salary|compensation|desired pay|expected pay|pay (rate|range|expectation)|hourly rate|wage|stipendio|retribuzione|\bral\b|gehalt|salaire|salario/i;
 
-const EDUCATION_NEIGHBOUR = /school|university|college|degree|field of study|major|education|graduat|start date|end date/i;
+/** Italian degree names and the English words a form in English uses for them. */
+const ENGLISH_DEGREE: [RegExp, string][] = [
+  [/laurea (triennale|di primo livello)|^laurea$/i, "Bachelor's degree"],
+  [/laurea (magistrale|specialistica)/i, "Master's degree"],
+  [/dottorato/i, "PhD"],
+  [/diploma|maturità/i, "High school diploma"],
+];
+
+/** How many label words a form has in English and in Italian: the language the form is written in. */
+export function formLanguageCounts(fields: Pick<DumpedField, "label">[]): { en: number; it: number } {
+  const labels = fields.map((f) => f.label).join(" ");
+  const en = (labels.match(/\b(name|first|last|email|phone|address|city|country|date|degree|school|resume|upload|company|title|start|end)\b/gi) ?? []).length;
+  const it = (labels.match(/\b(nome|cognome|telefono|indirizzo|città|paese|data|laurea|scuola|curriculum|azienda|ruolo|inizio|fine)\b/gi) ?? []).length;
+  return { en, it };
+}
+export const isItalianForm = (fields: Pick<DumpedField, "label">[]) => { const c = formLanguageCounts(fields); return c.it > c.en; };
+export { toItalian };
+const LANGUAGE_ASK = /fluent|fluency|proficien|speak|spoken|conversational|fluentemente|parli|conosc\w* (la lingua|l'|il )|sprichst|sprechen|fließend|parlez|courant|hablas|hablar|fluido/i;
+const YES_OPTION = /^(yes|s[iì]|ja|oui|s[ií]|sim)\b/i;
+const NO_OPTION = /^(no|nein|non|não)\b/i;
+const LANGUAGE_NAMES: Record<string, string[]> = {
+  english: ["english", "inglese", "englisch", "anglais", "ingl[eé]s"],
+  italian: ["italian", "italiano", "italienisch", "italien"],
+  german: ["german", "tedesco", "deutsch", "allemand", "alem[aã]n"],
+  french: ["french", "francese", "franz[oö]sisch", "fran[cç]ais", "franc[eé]s"],
+  spanish: ["spanish", "spagnolo", "spanisch", "espagnol", "espa[nñ]ol"],
+};
+const languageWords = (name: string) => LANGUAGE_NAMES[name.trim().toLowerCase()] ?? [name.trim().toLowerCase()];
+/** A box that holds one language of a language entry, by its whole label. */
+const LANGUAGE_BOX = /^\s*\*?\s*(language|lingua|sprache|langue|idioma|língua)\s*(name|\d+)?\s*:?\s*\*?\s*$/i;
+/** A box for the level of that language ("Speaking Proficiency", "Livello scritto"). */
+const LEVEL_BOX = /proficien|level|livello|niveau|nivel|kenntnis|competenz|fluency|padronanza/i;
+/** The option of a level list nearest the profile's level, tried from the most precise words down. */
+function levelOption(level: string, options: { label: string; value: string }[]) {
+  const l = level.toLowerCase();
+  const ladder = /native|madre|mother|c2/.test(l)
+    ? ["native|madrelingua|mother ?tongue|muttersprach|maternelle|nativ", "bilingu", "c2", "fluent|fluente|fließend|courant", "excellent|eccellente|ottim|expert|very good", "advanced|avanzat|c1", "high|alto"]
+    : /c1|fluent|advanced/.test(l)
+      ? ["c1", "advanced|avanzat|fluent|fluente", "very good|ottim|proficient", "upper.?intermediate|b2", "good|buon"]
+      : /b2|upper/.test(l)
+        ? ["b2", "upper.?intermediate", "good|buon", "intermediate|intermedi", "b1"]
+        : /b1|intermediate/.test(l)
+          ? ["b1", "intermediate|intermedi", "fair|discret", "b2"]
+          : ["a2", "a1", "basic|base|elementar|beginner|scolastic", "limited|limitat"];
+  for (const words of ladder) {
+    const hit = options.find((o) => new RegExp(`\\b(${words})`, "i").test(o.label));
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+const EDUCATION_NEIGHBOUR =/school|university|college|degree|field of study|major|education|graduat|start date|end date/i;
 const DATE_LABEL = /^(start|end)\s*(date|month|year)?$/i;
 
 /**
@@ -161,6 +213,13 @@ const DATE_LABEL = /^(start|end)\s*(date|month|year)?$/i;
  * Returns null when the field is not one of these.
  */
 export function educationDatePlan(f: DumpedField, previous: DumpedField[], profile: Profile): PlannedField | null {
+  // A whole date box of a school entry (Workday's "From" / "To (Actual or Expected)" year boxes in "#education-11--…").
+  const eduEntry = profile.education[0];
+  if (f.kind === "date" && eduEntry && /education/i.test(f.selector) && /^(from|to|start|end|dal|al|da|a)\b/i.test(f.label.trim())) {
+    const isStart = /^(from|start|dal|da)\b/i.test(f.label.trim());
+    const value = `${monthName(isStart ? eduEntry.startMonth : eduEntry.gradMonth)} ${isStart ? eduEntry.startYear : eduEntry.gradYear}`;
+    return { id: f.id, selector: f.selector, kind: f.kind, label: f.label, required: f.required, optionLabel: null, action: "fill", key: isStart ? "education_start_date" : "graduation_date", value, confidence: 1, note: "degree date from the profile" };
+  }
   if (!DATE_LABEL.test(f.label.trim()) || (f.kind !== "select" && f.kind !== "combobox") || f.options.length === 0) return null;
   if (!previous.some((p) => EDUCATION_NEIGHBOUR.test(p.label))) return null;
   const edu = profile.education[0];
@@ -182,16 +241,18 @@ export function educationDatePlan(f: DumpedField, previous: DumpedField[], profi
   return { ...base, action: "fill", key: isStart ? "education_start_date" : "graduation_date", value: f.kind === "select" ? opt.value : opt.label, optionLabel: opt.label, confidence: 1, note: "degree date from the profile" };
 }
 
-const EMPLOYMENT_NEIGHBOUR = /company|employer|job title|^title$|position|^role$/i;
+const EMPLOYMENT_NEIGHBOUR = /company|employer|job title|^title$|position|^role$|role description|job description|responsibilit|azienda|datore|qualifica|ruolo|mansion/i;
 const SCHOOL_NEIGHBOUR = /school|university|college|degree|discipline|field of study|major/i;
-const WORK_DATE_LABEL = /^(start|end)\s*(?:date)?\s*(month|year)?$/i;
+// "From" / "To" in a work entry (Workday) are its start and end too, and so are their Italian words.
+const WORK_DATE_LABEL = /^(start|end|from|to|dal|al|da|a|inizio|fine|data (?:di )?inizio|data (?:di )?fine)\s*(?:date)?\s*(month|year)?\s*\*?$/i;
+const WORK_START = /^(start|from|dal|da|inizio|data (?:di )?inizio)$/i;
 const CURRENT_ROLE = /^(current role|current position|i currently work here|currently work here)$/i;
 
 /** Which block a date field sits in, from the nearest field above it that is not itself a date. */
 export function sectionOf(previous: DumpedField[]): "education" | "employment" | null {
   for (let i = previous.length - 1; i >= 0; i--) {
     const label = (previous[i] as DumpedField).label.trim();
-    if (/^(start|end)\b/i.test(label) || CURRENT_ROLE.test(label)) continue;
+    if (/^(start|end)\b/i.test(label) || WORK_DATE_LABEL.test(label) || CURRENT_ROLE.test(label)) continue;
     if (EMPLOYMENT_NEIGHBOUR.test(label)) return "employment";
     return SCHOOL_NEIGHBOUR.test(label) ? "education" : null;
   }
@@ -204,7 +265,8 @@ export function sectionOf(previous: DumpedField[]): "education" | "employment" |
  */
 export function employmentDatePlan(f: DumpedField, previous: DumpedField[], profile: Profile): PlannedField | null {
   const exp = profile.experience[0];
-  if (!exp || sectionOf(previous) !== "employment") return null;
+  // A box named for the work history ("workExperience-10--endDate") is in it whatever the labels above it say.
+  if (!exp || (sectionOf(previous) !== "employment" && !/work.?experience|employment|job.?history/i.test(f.selector))) return null;
   const label = f.label.trim();
   const base = { id: f.id, selector: f.selector, kind: f.kind, label: f.label, required: f.required, optionLabel: null as string | null };
   if (f.kind === "checkbox" && CURRENT_ROLE.test(label)) {
@@ -214,7 +276,7 @@ export function employmentDatePlan(f: DumpedField, previous: DumpedField[], prof
   }
   const m = WORK_DATE_LABEL.exec(label);
   if (!m) return null;
-  const isStart = /^start/i.test(m[1] as string);
+  const isStart = WORK_START.test(m[1] as string);
   const date = /^(\d{4})-(\d{2})/.exec(isStart ? exp.start : exp.end);
   if (!date) return isStart || !exp.current ? null : { ...base, action: "skip", key: "leave_blank", value: null, confidence: 1, note: "still in this job, no end date" };
   const year = date[1] as string;
@@ -232,6 +294,8 @@ export function employmentDatePlan(f: DumpedField, previous: DumpedField[], prof
     return { ...base, action: "fill", key, value: f.kind === "select" ? opt.value : opt.label, optionLabel: opt.label, confidence: 1, note };
   }
   if (part === "year" && (f.kind === "text" || f.kind === "number")) return { ...base, action: "fill", key, value: year, confidence: 1, note };
+  // A whole date box (Workday's month/year spin boxes): the month and year, which the date filler writes its way.
+  if (!part && f.kind === "date") return { ...base, action: "fill", key, value: `${monthName(month)} ${year}`, confidence: 1, note };
   return null;
 }
 
@@ -263,6 +327,9 @@ export async function mapForm(jev: JevClient, profile: Profile, job: Job, dump: 
   const hit = plans.get(key);
   if (hit) return { ...hit, jobId: job.id, url: dump.url, jevCostUsd: 0 };
   const plan = await mapFormFresh(jev, profile, job, dump);
+  // A plan whose resume box went without the job's resume (its draft was not written then) is not kept: next time
+  // the resume may be there.
+  if (plan.fields.some((f) => f.key === "resume_upload" && f.action !== "upload")) return plan;
   plans.set(key, plan);
   plans.save();
   return plan;
@@ -274,7 +341,11 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
   const resolvedInCode = new Set<string>();
   dump.fields.forEach((f, i) => {
     const above = dump.fields.slice(Math.max(0, i - 8), i);
-    const p = employmentDatePlan(f, above, profile) ?? (sectionOf(above) === "employment" ? null : educationDatePlan(f, dump.fields.slice(Math.max(0, i - 4), i), profile));
+    // A box named for its block (Workday: "#education-11--…", "#workExperience-10--…") belongs to it, wherever it was read.
+    const named = /education/i.test(f.selector) ? "education" : /work.?experience|employment|job.?history/i.test(f.selector) ? "employment" : null;
+    const p = named === "education"
+      ? educationDatePlan(f, dump.fields.slice(Math.max(0, i - 4), i), profile)
+      : employmentDatePlan(f, above, profile) ?? (sectionOf(above) === "employment" || named ? null : educationDatePlan(f, dump.fields.slice(Math.max(0, i - 4), i), profile));
     if (p) {
       planned.push(p);
       resolvedInCode.add(f.id);
@@ -282,7 +353,8 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
   });
   // Tailored documents, when the person asked for them: the resume written for this job goes in the resume box,
   // and a cover letter is written when the form has a box for one, as a file or as text.
-  const coverBox = dump.fields.some((f) => COVER_LABEL.test(`${f.label} ${f.name} ${f.hint}`));
+  // A file box is read as the attach step reads it, so a box named only by its section ("Upload Cover Letter") counts.
+  const coverBox = dump.fields.some((f) => (f.kind === "file" ? fileBoxWants(f) === "cover" : COVER_LABEL.test(`${f.label} ${f.name} ${f.hint}`)));
   const policy = documentPolicy();
   let docs = documentsFor(job.id, profile);
   if ((policy.resume && !docs) || (policy.cover && coverBox && !docs?.coverText)) {
@@ -291,9 +363,9 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
       try {
         docs = await tailorJob(profile, entry, { cover: policy.cover && coverBox });
       } catch (err) {
-        // A draft the truth gate refused, or a print that failed, is no reason to skip the job: the profile's own resume goes.
-        console.log(`   tailored documents not used: ${err instanceof Error ? err.message : String(err)}. Sending the profile's resume instead.`);
-        docs = null;
+        // A letter that failed leaves the resume already written for this job; the profile's own resume never goes.
+        console.log(`   tailored documents not written: ${err instanceof Error ? err.message : String(err)}.`);
+        docs = documentsFor(job.id, profile);
       }
     }
   }
@@ -340,23 +412,105 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
     // The one transcript on file is the undergraduate one unless the profile holds a graduate degree.
     const graduate = profile.education.some((e) => /master|\bm\.?sc?\b|\bmba\b|ph\.?d|doctor/i.test(e.degree));
     const file =
-      want === "resume" ? (policy.resume && docs ? docs.resume : profile.resume.path)
+      want === "resume" ? (policy.resume ? (docs?.resume ?? null) : profile.resume.path)
       : want === "cover" ? (policy.cover && docs?.cover ? docs.cover : null)
       : want === "transcript" || (want === "graduate_transcript" && graduate) ? (profile.transcript?.path ?? null)
+      // A photo goes in whenever the form has a box for one (owner's rule) and the profile holds one.
+      : want === "photo" ? (profile.photo?.path ?? null)
       : null;
     planned.push({
       id: f.id, selector: f.selector, kind: f.kind, label: f.label, required: f.required,
       action: file ? "upload" : "skip", key: want === "resume" ? "resume_upload" : "leave_blank",
       value: file, optionLabel: null, confidence: 1,
-      note: file ? (want === "resume" && file !== profile.resume.path ? "the resume written for this job" : want === "cover" ? "the cover letter written for this job" : null) : want === "autofill" ? "autofill helper, skipped so it does not overwrite the plan" : want === "transcript" ? "asks for a transcript. Set transcript.path in your profile to attach one" : want === "graduate_transcript" ? "asks for a graduate transcript, and the profile has no graduate degree" : want === "cover" ? "asks for a cover letter. Run apply --cover to write one" : "not a resume upload",
+      note: file ? (want === "resume" && file !== profile.resume.path ? "the resume written for this job" : want === "cover" ? "the cover letter written for this job" : null) : want === "autofill" ? "autofill helper, skipped so it does not overwrite the plan" : want === "photo" ? "asks for a photo. Set photo.path in your profile to attach one" : want === "transcript" ? "asks for a transcript. Set transcript.path in your profile to attach one" : want === "graduate_transcript" ? "asks for a graduate transcript, and the profile has no graduate degree" : want === "cover" ? "asks for a cover letter. Run apply --cover to write one" : "not a resume upload",
     });
+  });
+  // A group of boxes whose question is required gets at least one ticked: the one most likely to be the candidate's.
+  const groups = new Map<string, DumpedField[]>();
+  for (const f of dump.fields.filter((x) => x.kind === "checkbox" && x.groupRequired)) groups.set(f.section, [...(groups.get(f.section) ?? []), f]);
+  for (const boxes of groups.values()) {
+    const plans = boxes.map((f) => planned.find((p) => p.id === f.id)).filter((p): p is PlannedField => !!p);
+    if (!plans.length || plans.some((p) => p.action === "fill")) continue;
+    const likely = (p: PlannedField) => (p.action === "skip" ? 1 - p.confidence : 0.5);
+    const best = plans.reduce((a, b) => (likely(b) > likely(a) ? b : a));
+    const at = planned.indexOf(best);
+    planned[at] = { ...best, action: "fill", key: "checked", value: "true", required: true, note: "one box of a required group" };
+  }
+  // A pick with a qualifier the profile never names ("Agricultural Economics", "Applied Economics") gives way to the
+  // plain row the list also holds ("Economics").
+  const said = JSON.stringify(profile).toLowerCase();
+  planned.forEach((p, at) => {
+    const f = dump.fields.find((x) => x.id === p.id);
+    if (!f || p.action !== "fill" || !p.value || f.options.length < 2) return;
+    const pick = p.value.trim();
+    const plain = f.options.map((o) => o.label.trim()).find((o) => o.length >= 4 && o.length < pick.length && pick.toLowerCase().endsWith(` ${o.toLowerCase()}`));
+    if (!plain) return;
+    const qualifier = pick.slice(0, pick.length - plain.length).toLowerCase().split(/[^a-z]+/).filter((w) => w.length >= 4);
+    if (qualifier.length && !qualifier.some((w) => said.includes(w.slice(0, 5)))) planned[at] = { ...p, value: plain, optionLabel: plain, note: p.note ?? `the plain "${plain}" rather than "${pick}"` };
+  });
+  // A form written in English gets the candidate's degree in English words ("Laurea triennale" as "Bachelor's degree").
+  const { en, it } = formLanguageCounts(dump.fields);
+  if (en > 2 * it) {
+    planned.forEach((p, at) => {
+      if (p.action !== "fill" || !p.value || !["degree", "education_level"].includes(p.key ?? "")) return;
+      const english = ENGLISH_DEGREE.find(([re]) => re.test(p.value as string))?.[1];
+      if (english && !dump.fields.find((x) => x.id === p.id)?.options.length) planned[at] = { ...p, value: english, note: p.note ?? `the degree in the form's language` };
+    });
+  }
+  // A form written in Italian gets the profile's English words in Italian ("Italy" as "Italia", "Italian (Native)" as
+  // "Italiano (madrelingua)"), in boxes and in lists that are searched by what is typed. A list whose options were read
+  // keeps the option it picked.
+  if (it > en) {
+    planned.forEach((p, at) => {
+      const f = dump.fields.find((x) => x.id === p.id);
+      if (p.action !== "fill" || !p.value || !f || ["email", "file"].includes(f.kind) || f.options.some((o) => o.label === p.value || o.value === p.value)) return;
+      const italian = toItalian(p.value);
+      if (italian !== p.value) planned[at] = { ...p, value: italian, note: p.note ?? "in the form's language" };
+    });
+  }
+  // A box for one language (a language entry: "Language", then "Speaking Proficiency", "Writing Proficiency") takes one
+  // language's name, never the whole list with levels; repeated entries take the profile's languages in order. The
+  // entry's level lists take that language's level, as one of their options.
+  let entry = -1;
+  dump.fields.forEach((f) => {
+    if (LANGUAGE_BOX.test(f.label) && f.kind !== "file") {
+      entry++;
+      const spoken = profile.spokenLanguages[entry];
+      const at = planned.findIndex((p) => p.id === f.id);
+      if (!spoken || at < 0) return;
+      const words = languageWords(spoken.name);
+      const option = f.options.find((o) => words.some((w) => new RegExp(`^\\s*${w}\\b`, "i").test(o.label)));
+      if (f.options.length && !option) return;
+      const name = it > en ? toItalian(spoken.name) : spoken.name;
+      planned[at] = { ...planned[at]!, action: "fill", key: "spoken_languages", value: option ? (f.kind === "select" ? option.value : option.label) : name, optionLabel: option?.label ?? null, confidence: 0.9, note: `language ${entry + 1} of the profile` };
+      return;
+    }
+    if (entry < 0 || !LEVEL_BOX.test(f.label) || !f.options.length) return;
+    const spoken = profile.spokenLanguages[entry];
+    const at = planned.findIndex((p) => p.id === f.id);
+    if (!spoken || at < 0) return;
+    const option = levelOption(spoken.level, f.options);
+    if (option) planned[at] = { ...planned[at]!, action: "fill", key: "spoken_languages", value: f.kind === "select" ? option.value : option.label, optionLabel: option.label, confidence: 0.9, note: `${spoken.name} ${spoken.level} in the profile` };
+  });
+  // A Yes/No question on speaking a language the profile lists ("Are you fluent in English?") is answered from its
+  // level: B1 and up is yes (a near miss is yes), A1/A2 is no.
+  planned.forEach((p, at) => {
+    const f = dump.fields.find((x) => x.id === p.id);
+    if (!f || !LANGUAGE_ASK.test(f.label)) return;
+    const yes = f.options.find((o) => YES_OPTION.test(o.label.trim()));
+    const no = f.options.find((o) => NO_OPTION.test(o.label.trim()));
+    if (!yes || !no || f.options.filter((o) => o.label.trim() && !/^(select|seleziona|choose|scegli)/i.test(o.label.trim())).length !== 2) return;
+    const spoken = profile.spokenLanguages.find((l) => languageWords(l.name).some((w) => new RegExp(`\\b${w}`, "i").test(f.label)));
+    if (!spoken) return;
+    const pick = /\b(a1|a2|basic|beginner|elementar|base)\b/i.test(spoken.level) ? no : yes;
+    planned[at] = { ...p, action: "fill", key: "spoken_languages", value: f.kind === "select" ? pick.value : pick.label, optionLabel: pick.label, confidence: 0.9, note: `${spoken.name} ${spoken.level} in the profile` };
   });
   const ordered = dump.fields.map((f) => planned.find((p) => p.id === f.id) as PlannedField);
   return {
     jobId: job.id,
     url: dump.url,
     fields: ordered,
-    fills: ordered.filter((p) => p.action === "fill" && p.value !== null).map((p) => ({ selector: p.selector, kind: p.kind, value: p.value as string })),
+    fills: ordered.filter((p) => p.action === "fill" && p.value !== null).map((p) => ({ selector: p.selector, kind: p.kind, value: p.value as string, required: p.required })),
     uploads: ordered.filter((p) => p.action === "upload").map((p) => ({ selector: p.selector, path: p.value as string })),
     drafts: ordered.filter((p) => p.action === "draft").map((p) => {
       const f = dump.fields.find((x) => x.id === p.id) as DumpedField;
@@ -457,7 +611,7 @@ export function planField(f: DumpedField, answer: Answer | undefined, profile: P
   }
   if (isProfileKey(key)) {
     const value = valueForJob(profile, job, key as FieldKey);
-    if (value === null) {
+    if (value === null || !value.trim()) {
       if (key === "gpa") return { ...base, action: f.required ? "fill" : "skip", key, value: f.required ? gpaValue(profile) : null, confidence: a.confidence, note: f.required ? "GPA given only because the field is required" : "GPA not volunteered" };
       return { ...base, action: f.required ? "review" : "skip", key, value: null, confidence: a.confidence, note: f.required ? "required but the profile has no value" : null };
     }
@@ -528,14 +682,16 @@ const PICK_A_DATE = /^(pick|select|choose|enter|seleziona|scegli|inserisci|wähl
 
 export const COVER_LABEL = /cover\s*letter|covering letter|letter of (motivation|interest|application)|motivation letter|anschreiben|motivationsschreiben|lettera di (presentazione|motivazione|accompagnamento)|lettre de motivation|carta de presentaci[oó]n/i;
 
-export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "selector"> & { accept?: string }): "resume" | "cover" | "transcript" | "graduate_transcript" | "autofill" | "other" | "unnamed" {
+export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "selector"> & { accept?: string; section?: string }): "resume" | "cover" | "transcript" | "graduate_transcript" | "autofill" | "photo" | "other" | "unnamed" {
   const text = `${f.label} ${f.name} ${f.hint} ${f.selector}`;
   // SmartRecruiters' "apply with your resume" box reads the file and writes what it finds over the form.
   if (/autofill|auto-fill|parse|prefill|apply[-_ ]with[-_ ](your[-_ ])?resume/i.test(text)) return "autofill";
   // A box that takes only pictures is a photo box, whatever its words ("Carica immagine del profilo").
   const accept = (f.accept ?? "").trim();
-  if (accept && /image|\.(jpe?g|png|gif|webp|heic|bmp)\b/i.test(accept) && !/pdf|\.docx?\b|application\//i.test(accept)) return "other";
-  if (/\b(immagine|foto|photo|picture|image|bild|avatar)\b/i.test(f.label) && !/resume|\bcv\b|curriculum/i.test(f.label)) return "other";
+  if (accept && /image|\.(jpe?g|png|gif|webp|heic|bmp)\b/i.test(accept) && !/pdf|\.docx?\b|application\//i.test(accept)) return "photo";
+  if (/\b(immagine|foto|fotografia|photo|picture|image|bild|avatar)\b/i.test(f.label) && !/resume|\bcv\b|curriculum/i.test(f.label)) return "photo";
+  // A box that takes only videos is a question answered on camera: never a document of the candidate's.
+  if ((accept && accept.split(",").every((x) => /video\/|\.(mp4|mpe?g|avi|mov|mkv|wmv|ogv|webm|flv|m4v)$/i.test(x.trim()))) || /\(a video answer\)$/.test(f.label)) return "other";
   // The box's own question decides first. One box that asks for the resume and the cover letter together
   // (Cornerstone: "Please upload your resume and cover letter") gets the resume, which no application goes without.
   const RESUME = /resume|résumé|\bcv\b|curriculum|lebenslauf/i;
@@ -546,6 +702,10 @@ export function fileBoxWants(f: Pick<DumpedField, "label" | "name" | "hint" | "s
   if (COVER_LABEL.test(text) && !RESUME.test(text)) return "cover";
   if (/transcript/i.test(text)) return /\b(graduate|master|phd|doctoral)\b/i.test(text) && !/undergraduate/i.test(text) ? "graduate_transcript" : "transcript";
   if (RESUME.test(text)) return "resume";
+  // A box that names no document ("Upload Document") under a heading that does (Cornerstone: "Upload Cover Letter").
+  const section = /other|additional|attachment|allegat|aggiuntiv|weitere|anhang/i.test(f.label) ? "" : f.section ?? "";
+  if (COVER_LABEL.test(section) && !RESUME.test(section)) return "cover";
+  if (RESUME.test(section) && !COVER_LABEL.test(section)) return "resume";
   if (/cover|letter|portfolio|photo|picture|certificate|writing sample|work sample|reference|other|additional|supplementar|aggiuntiv|ulterior|altri (documenti|allegati|file)|certificat|attestat|zusätzlich|weitere|supplémentaire|adicional/i.test(text)) return "other";
   return "unnamed";
 }
@@ -560,7 +720,9 @@ function agreedConfidence(a: ChoiceAnswer, profile: Profile, job: Job): number {
 
 function gpaValue(profile: Profile): string | null {
   const g = profile.education[0]?.gpa;
-  return g?.cumulative !== undefined ? g.cumulative.toFixed(2) : null;
+  if (g?.cumulative === undefined) return null;
+  // A grade on another scale than 4 is written with its scale, the way the candidate's country states it: "105/110".
+  return g.scale === 4 ? g.cumulative.toFixed(2) : `${g.cumulative}/${g.scale}`;
 }
 
 /** Profile value for a key, with the two job-dependent keys resolved against the posting's country. */

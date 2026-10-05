@@ -59,10 +59,10 @@ describe("remember and recall", () => {
     expect(hits.get("#q2")).toMatchObject({ value: "Acme builds rockets.", reusable: false, source: "same form" });
     expect(recallSameFields(mem, "job1", FP, [{ ...(open[1] as OpenField), label: "Why Acme, in one line?" }]).size).toBe(0);
   });
-  it("judges a held form whole again instead of reusing parts of it", () => {
+  it("judges a held form whole again instead of reusing it or parts of it", () => {
     const held = remember(empty(), { jobId: "job1", company: "Acme", fingerprint: FP, open, resolution: { ...resolution, verdict: "needs_review" }, landed: () => true });
     expect(recallSameFields(held, "job1", FP, [open[0] as OpenField]).size).toBe(0);
-    expect(recallForm(held, "job1", FP, open)?.verdict).toBe("needs_review");
+    expect(recallForm(held, "job1", FP, open)).toBeNull();
   });
   it("forgets everything when the candidate's context changes", () => {
     expect(recallForm(mem, "job1", "fp2", open)).toBeNull();

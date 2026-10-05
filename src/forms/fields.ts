@@ -32,6 +32,8 @@ export const DumpedField = z.object({
   autocomplete: z.string().default(""),
   /** Nearest heading above the control: "Education", "Work authorization", "Voluntary self-identification". */
   section: z.string().default(""),
+  /** A checkbox of a group whose question is required: at least one box of the group must be ticked. */
+  groupRequired: z.boolean().optional(),
   /** True when the "radio" is a group of plain buttons rather than input elements. */
   buttonGroup: z.boolean().default(false),
   /** Set on a second look: the whole list is shown to JEV however long it is, up to FORM.maxOptionsSecondLook. */

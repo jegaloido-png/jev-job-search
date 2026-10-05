@@ -92,13 +92,12 @@ describe("what holds a form and what does not", () => {
   it("holds the form when its own server refused a save, even on an optional field", () => {
     expect(splitFailures(plan, [{ selector: "#opt", why: "the form's own server refused 1 save(s): 429" }], shown).holds).toHaveLength(1);
   });
-  it("holds the form when more than a couple of optional fields would not take a value: that is a fill gone wrong", () => {
+  it("never holds the form for optional fields that would not take a value, however many", () => {
     const many = { fields: ["#a", "#b", "#c"].map((sel) => field(sel)) } as unknown as Parameters<typeof splitFailures>[0];
     const failed = ["#a", "#b", "#c"].map((selector) => ({ selector, why }));
-    expect(splitFailures(many, failed.slice(0, 2), ["", "", ""]).leftBlank).toHaveLength(2);
     const all = splitFailures(many, failed, ["", "", ""]);
-    expect(all.leftBlank).toEqual([]);
-    expect(all.holds).toHaveLength(3);
+    expect(all.leftBlank).toHaveLength(3);
+    expect(all.holds).toEqual([]);
   });
   it("says what a pay box that takes only a number is waiting for", () => {
     expect(splitFailures(plan, [{ selector: "#pay", why }], shown).holds[0]?.why).toMatch(/takes only a number/);

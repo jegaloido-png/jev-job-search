@@ -12,18 +12,39 @@ import { openPrivacyNotice } from "./account.js";
 import { sleep, type Page } from "./cdp.js";
 import { emptyRequired, loadPlan, loadReport, pickSubmit } from "./report.js";
 import type { FillPlan } from "../forms/fields.js";
-import { buttonPoint, controlStates, dump, inFront, install, pageFor, shownValues, type Point } from "./session.js";
+
+/** Runs in the page: for each error mark shown, the words of the small box around it (its field), shadow roots included. */
+// A visible challenge frame of a known bot check, big enough to be a puzzle a person has to solve.
+const CHALLENGE_SHOWN = `[...document.querySelectorAll("iframe")].some((f) => { const b = f.getBoundingClientRect(); const s = f.src || ""; return b.width > 200 && b.height > 200 && getComputedStyle(f).visibility !== "hidden" && /hcaptcha|recaptcha|turnstile|challenges\\.cloudflare|arkoselabs|funcaptcha/i.test(s); })`;
+const ERROR_PLACES = `(() => {
+  const all = [];
+  const walk = (root) => { for (const el of root.querySelectorAll("*")) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+  walk(document);
+  const marks = all.filter((el) => (el.matches('[aria-invalid="true"], [role=alert], [class*="error" i], [class*="invalid" i], [value-state="Error"]')) && (el.offsetWidth || el.offsetHeight));
+  const out = [];
+  for (const m of marks) {
+    let box = m;
+    for (let i = 0; i < 4 && box.parentElement && (box.parentElement.innerText || "").length < 220; i++) box = box.parentElement;
+    const t = (box.innerText || box.getAttribute("aria-label") || box.tagName).replace(/\\s+/g, " ").trim().slice(0, 110);
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out.slice(0, 8).join(" || ");
+})()`;
+import { buttonPoint, controlStates, dump, inFront, install, pageFor, shownValues, trace, type Point } from "./session.js";
 
 const run = promisify(exec);
 
 /** Clicks the form's Submit control and reports what the page became. */
-export async function submitJob(jev: JevClient, jobId: string, force = false): Promise<{ state: PageState["state"]; confidence: number; url: string; errors: string[]; needsCode: boolean; humanCheck: boolean; refused: boolean; excerpt: string }> {
+export async function submitJob(jev: JevClient, jobId: string, force = false): Promise<{ state: PageState["state"]; confidence: number; url: string; errors: string[]; needsCode: boolean; humanCheck: boolean; refused: boolean; ineligible: boolean; excerpt: string }> {
   const r = loadReport(jobId);
   if (!r.ready && !force) throw new Error(`not ready to submit: ${r.resolution?.reason || [...r.missingRequired.map((l) => `empty: ${l.slice(0, 50)}`), ...r.failed.map((f) => `failed: ${f.label.slice(0, 50)}`), ...r.reviews.map((x) => `review: ${x.label.slice(0, 50)}`), ...r.drafts.map((x) => `draft: ${x.label.slice(0, 50)}`)].join("; ") || r.reason}`);
   const page = await pageFor(jobId);
   try {
     const { dump: d, plan } = loadPlan(jobId);
-    const pick = pickSubmit(plan.submitSelectors);
+    let pick = pickSubmit(plan.submitSelectors);
+    // The button the plan named may have been drawn again since the page was read (Teamtailor: input[name=commit]
+    // gone): the page's own Submit as it stands now is taken.
+    if (!pick || !(await buttonPoint(page, pick)).ok) pick = pickSubmit((await dump(page)).submitSelectors) ?? pick;
     if (!pick) throw new Error("No submit control in the plan.");
     if (!force) {
       // A question may have appeared since the page was read, or the tool may never have seen one. The whole page is
@@ -50,7 +71,7 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
     // Other forms may be filling in their own tabs. The click takes its turn for the front of the window.
     await inFront(page, async () => {
       // A cookie banner still open (one that came up late) is answered before the click, with its most private choice.
-      await declineCookieBanner(page);
+      await declineCookieBanner(page, false);
       let p = await buttonPoint(page, pick);
       if (!p.ok) throw new Error(`Submit control ${pick.selector} is not on the page.`);
       // A cookie banner over the button would take the click. It is answered with its most private choice
@@ -80,6 +101,11 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
     }
     await sleep(BROWSER.pollMs * 6);
     after = await settledRead(page, "window.__awj.pageText()", after);
+    // A page still saying it is sending ("Submitting…", Workable) has not answered yet: it is given up to 45 s more.
+    for (const until = Date.now() + 45_000; SENDING.test(after) && Date.now() < until; ) {
+      await sleep(BROWSER.pollMs * 5);
+      after = await settledRead(page, "window.__awj.pageText()", after);
+    }
     const url = await page.evaluate<string>("location.href");
     let state = await decidePageState(jev, after, url, jobId, await afterSubmit());
     let errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
@@ -122,6 +148,30 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
         errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
       }
     }
+    // The site's own server said it failed for now ("An error occurred, please try again later", SmartRecruiters):
+    // the form still holds every answer, so Submit is pressed again after a pause, twice at most.
+    for (let retry = 0; retry < 2 && state.state !== "submitted" && TRY_LATER.test(after) && !TRY_LATER.test(before); retry++) {
+      const again = await page.awj<Point>("point", pick.selector);
+      if (!again.ok) break;
+      console.log(`  the site answered "try again later": pressing Submit again (${retry + 1})`);
+      await sleep(8_000 * (retry + 1));
+      const shown = after;
+      await inFront(page, () => page.click(again.x, again.y));
+      const until = Date.now() + BROWSER.submitMs + BROWSER.confirmMs;
+      while (Date.now() < until) {
+        await sleep(BROWSER.pollMs * 6);
+        try {
+          after = await settledRead(page, "window.__awj.pageText()", after);
+        } catch {
+          continue; // mid-navigation
+        }
+        if (!TRY_LATER.test(after) || after !== shown) break;
+      }
+      await sleep(BROWSER.pollMs * 6);
+      after = await settledRead(page, "window.__awj.pageText()", after);
+      state = await decidePageState(jev, after, await page.evaluate<string>("location.href"), jobId, await afterSubmit());
+      errors = await settledRead<string[]>(page, "window.__awj.errors()", []);
+    }
     // A board that emails a code: with CODE_COMMAND set, the code is read from the person's mailbox and typed in.
     if (state.state !== "submitted" && SECURITY_CODE.test(after) && process.env.CODE_COMMAND) {
       const code = await mailedCode(process.env.CODE_COMMAND, { url: r.url, company: r.company, since: clickedAt });
@@ -160,7 +210,12 @@ export async function submitJob(jev: JevClient, jobId: string, force = false): P
     // puts "Create Account" under "Your application has successfully been submitted", which read as a sign-in page).
     if (state.state !== "submitted" && SAYS_SENT.test(after) && !SAYS_SENT.test(before)) state = { ...state, state: "submitted", confidence: Math.max(state.confidence, 0.9) };
     const notSent = state.state !== "submitted";
-    return { state: state.state, confidence: state.confidence, url: await page.evaluate<string>("location.href"), errors, needsCode: notSent && SECURITY_CODE.test(after), humanCheck: notSent && !SECURITY_CODE.test(after) && HUMAN_CHECK.test(after), refused: notSent && ALREADY_APPLIED.test(after), excerpt: after.replace(/\s+/g, " ").slice(-400) };
+    // A challenge drawn in its own frame over the form (hCaptcha, reCAPTCHA, Turnstile) has no words in the page text.
+    const challenge = notSent && !errors.length && (await page.evaluate<boolean>(CHALLENGE_SHOWN).catch(() => false));
+    if (challenge) trace("after submit, a bot challenge is shown over the form");
+    // A page that says only "correct the errors below": the words of each field box an error mark sits in, for the log.
+    if (notSent && errors.length) trace(`after submit, errors sit in: ${await page.evaluate<string>(ERROR_PLACES).catch(() => "")}`.slice(0, 700));
+    return { state: state.state, confidence: state.confidence, url: await page.evaluate<string>("location.href"), errors, needsCode: notSent && SECURITY_CODE.test(after), humanCheck: challenge || (notSent && !SECURITY_CODE.test(after) && HUMAN_CHECK.test(after)), refused: notSent && ALREADY_APPLIED.test(after), ineligible: notSent && NOT_ELIGIBLE.test(after), excerpt: after.replace(/\s+/g, " ").slice(-400) };
   } finally {
     page.close();
   }
@@ -218,6 +273,9 @@ export const DECLINE_COOKIES =
 const COOKIE_SETTINGS =
   "^\\s*(cookie settings|cookies settings|cookie preferences|manage (cookies|cookie preferences|preferences|settings)|customi[sz]e( cookies)?|more options|" +
   "impostazioni( dei)? cookie|personalizza|gestisci (le )?preferenze|preferenze( dei)? cookie|cookie-einstellungen|einstellungen|paramètres( des cookies)?|personnaliser|configurar( cookies)?|personalizar)\\s*$";
+/** A cookie banner's "accept all" button: while it shows, a banner is on screen. */
+const ACCEPT_ALL_COOKIES =
+  "^\\s*(accept all( cookies)?|allow all( cookies)?|accept and close|accetta tutt[io]( i cookie)?|accetta e chiudi|consenti tutt[io]|alle (cookies )?(akzeptieren|zulassen|erlauben)|tout accepter|accepter (tout|et fermer)|aceptar (todas?|y cerrar)( las cookies)?|aceitar tod[ao]s)\\s*$";
 /** In a cookie banner's settings, the button that saves the choices as they stand: only the necessary cookies are on. */
 const SAVE_COOKIE_CHOICES =
   "^\\s*(confirm my choices|save (my )?(settings|choices|preferences)|salva (le )?(impostazioni|preferenze|scelte)|conferma (le )?(mie )?scelte|auswahl (speichern|bestätigen)|einstellungen speichern|enregistrer( mes choix)?|guardar( configuración)?)\\s*$";
@@ -227,7 +285,7 @@ const SAVE_COOKIE_CHOICES =
  * choice (Usercentrics: "Cookie settings" and "Accept all cookies") is opened at its settings, where "Deny optional
  * cookies" or saving the untouched choices is. Returns whether a banner was answered.
  */
-export async function declineCookieBanner(page: Page): Promise<boolean> {
+export async function declineCookieBanner(page: Page, settings = true): Promise<boolean> {
   const press = async (pattern: string): Promise<boolean> => {
     const b = await page.awj<Point>("clickByText", pattern);
     if (!b.ok || b.href) return false;
@@ -236,9 +294,21 @@ export async function declineCookieBanner(page: Page): Promise<boolean> {
     return true;
   };
   if (await press(DECLINE_COOKIES)) return true;
+  // The settings layer is opened only for a banner on screen, one that offers "accept all". A page's own lasting
+  // "Manage cookies" button opens it too, and saving the choice there reloads the page (Teamtailor): a filled form
+  // came back empty and was submitted so. Right before Submit (`settings` false) it is never opened.
+  if (!settings || !(await page.awj<Point>("clickByText", ACCEPT_ALL_COOKIES)).ok) return false;
   if (!(await press(COOKIE_SETTINGS))) return false;
   return (await press(DECLINE_COOKIES)) || (await press(SAVE_COOKIE_CHOICES));
 }
+
+/** A page whose server failed the send for now and asks to try again. */
+const TRY_LATER = /(please )?try again later|riprova(re)? più tardi|réessayer plus tard|réessayez plus tard|später erneut|inténtalo (de nuevo )?más tarde|vuelve a intentarlo más tarde|tente novamente mais tarde/i;
+/** A page that says its Submit is still on the way. */
+const SENDING = /\b(submitting|sending|invio in corso|invio\.\.\.|wird gesendet|wird übermittelt|envoi en cours|enviando)\s*(…|\.\.\.)/i;
+
+/** A form whose answer to a screening question rules the candidate out. The job is skipped, not held. */
+export const NOT_ELIGIBLE = /you (have|need) to meet (these|the|all) requirements|you do not meet (the|these) (minimum )?requirements|devi soddisfare (questi|i) requisiti|non soddisfi (i|questi) requisiti|vous devez remplir ces (conditions|crit[eè]res)|sie m[uü]ssen (diese|die) (anforderungen|voraussetzungen) erf[uü]llen|debes cumplir (estos|los) requisitos/i;
 
 /** A board that refuses a second application from the same person for now. The job is skipped, not held. */
 export const ALREADY_APPLIED = /recently applied for another role|unable to accept an additional application|already (applied|submitted an application)/i;
@@ -251,7 +321,7 @@ export const SAYS_SENT =
 export const HUMAN_CHECK = /not a robot|i am human|i'm human|captcha|human check/i;
 
 /** A board that emails a code to confirm a person is applying, in the page's language (Greenhouse writes it in Italian on an Italian posting). */
-export const SECURITY_CODE = /verification code was sent|enter the \S+ code|security code|codice di (verifica|sicurezza)|sicherheitscode|bestätigungscode|code de (vérification|sécurité)|código de (verificación|seguridad)/i;
+export const SECURITY_CODE = /verification code was sent|passcode|\botp\b|one-?time (password|code)|codice monouso|password monouso|einmal(passwort|code)|code à usage unique|código de un solo uso|enter the \S+ code|security code|codice di (verifica|sicurezza)|sicherheitscode|bestätigungscode|code de (vérification|sécurité)|código de (verificación|seguridad)/i;
 
 /**
  * Reads the page a job's tab shows now, without clicking anything. This is how an application is

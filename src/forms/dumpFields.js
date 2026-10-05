@@ -6,6 +6,9 @@
   const SKIP_TYPES = new Set(["hidden", "submit", "button", "reset", "image", "search", "password"]);
   // Long enough for a question that follows a paragraph of legal text: the question is usually at the end.
   const LABEL_MAX = 700;
+  // A longer one keeps its start and its end, where the question is: cutting the end lost what was asked
+  // ("U.S. EXPORT COMPLIANCE … Please read and respond carefully …" with the question itself gone).
+  const LABEL_LONG = /^([\s\S]{250})[\s\S]+([\s\S]{447})$/;
   const seenRadio = new Set();
   const fields = [];
   const out = { url: location.href, title: document.title, context: "", fields, submitSelectors: [] };
@@ -165,11 +168,11 @@
   const cleanLabel = (el, label) => {
     const stripped = label.replace(/^(select\.\.\.|select an option|select|search|textbox|seleziona|scegli|cerca|auswählen|sélectionner|seleccionar)\s+/i, "").trim();
     if (stripped && !GENERIC.test(stripped)) return stripped;
-    return questionFor(el).replace(/\s*[*✱]\s*$/, "").slice(0, LABEL_MAX) || ownName(el) || label;
+    return questionFor(el).replace(/\s*[*✱]\s*$/, "").replace(LABEL_LONG, "$1 … $2") || ownName(el) || label;
   };
   // A file box is usually labelled by its button ("Attach", "Choose file"). Which file it wants is said by the question above it.
   // In the posting's language too: "Scegli un file o trascinalo qui", "Datei auswählen", "Choisir un fichier".
-  const FILE_BUTTON = /^(attach|upload|upload file|choose (a )?file|select (a )?file|browse|replace file|drop or select|drag and drop|svgs? not supported|file[-_ ]?input|file$|no file (selected|chosen)|dropbox|google drive|one ?drive|enter manually|from device|my computer|scegli (un )?file|seleziona (un )?file|carica (un )?file|allega (un |il )?file|sfoglia|trascina|nessun file|datei (auswählen|hochladen|wählen)|durchsuchen|choisir (un )?fichier|parcourir|glisser|seleccionar archivo|elegir archivo|examinar|bestand kiezen)/i;
+  const FILE_BUTTON = /^(attach|upload|upload file|choose (a )?file|select (a )?file|browse|replace file|drop or select|drag and drop|svgs? not supported|file[-_ ]?input|file$|no file (selected|chosen)|dropbox|google drive|one ?drive|enter manually|from device|my computer|scegli (un )?file|seleziona (un )?file|carica (un )?file|allega (un |il )?file|sfoglia|trascina|nessun file|datei (auswählen|hochladen|wählen|hinzufügen)|add (a )?file|aggiungi (un )?file|ajouter (un )?fichier|añadir archivo|durchsuchen|choisir (un )?fichier|parcourir|glisser|seleccionar archivo|elegir archivo|examinar|bestand kiezen)/i;
   // The question above a file box, skipping the box's own buttons ("Attach", "Dropbox", "Enter manually").
   const fileQuestion = (el) => {
     let cur = el;
@@ -187,7 +190,7 @@
   const fileLabel = (el, label) => {
     if (label && !FILE_BUTTON.test(label)) return label;
     const said = (inShadow(el) ? slotLabel(el, FILE_BUTTON) : "") || fileQuestion(el) || ownName(el) || (el.name || el.id || "").replace(/[-_]+/g, " ");
-    return said && !FILE_BUTTON.test(said) ? `${said.replace(/\s*[*✱]\s*$/, "")} (${label || "file"})`.slice(0, LABEL_MAX) : label;
+    return said && !FILE_BUTTON.test(said) ? `${said.replace(/\s*[*✱]\s*$/, "")} (${label || "file"})`.replace(LABEL_LONG, "$1 … $2") : label;
   };
   // The heading of the box a control sits in: the form's own label for the question, when the control itself carries no id for it.
   const fieldHeading = (el) => {
@@ -201,7 +204,7 @@
   const slotLabel = (el, skip = null) => {
     for (let cur = up(el), depth = 0; cur && cur !== document.body && depth < 16; cur = up(cur), depth++) {
       const given = [...cur.children].find((c) => /label/i.test(c.getAttribute("slot") || "") && text(c) && !(skip && skip.test(text(c))));
-      if (given) return text(given).slice(0, LABEL_MAX);
+      if (given) return text(given).replace(LABEL_LONG, "$1 … $2");
     }
     return "";
   };
@@ -233,7 +236,7 @@
       // so it must never be used: that would tick the wrong box.
       const next = el.nextElementSibling;
       const after = next && !next.matches("input, select, textarea") ? text(next) : (el.nextSibling && el.nextSibling.nodeType === 3 ? el.nextSibling.textContent.trim() : "");
-      return (after || (inShadow(el) ? slotLabel(el) || hostLabel(el) : "") || el.value || el.id || "").replace(/\s*[*✱]\s*$/, "").slice(0, LABEL_MAX);
+      return (after || (inShadow(el) ? slotLabel(el) || hostLabel(el) : "") || el.value || el.id || "").replace(/\s*[*✱]\s*$/, "").replace(LABEL_LONG, "$1 … $2");
     }
     if (!bits.join("").trim()) {
       // A label whose "for" names no element on the page (Cornerstone: <label for="actionItem.firstName.idTag"> over an
@@ -256,21 +259,53 @@
         cur = cur.parentElement; depth++;
       }
     }
-    return [...new Set(bits.map((b) => b.replace(/\s*[*✱]\s*$/, "").replace(/\s*[*✱]\s+/g, " ").trim()).filter(Boolean))].join(" ").slice(0, LABEL_MAX);
+    return [...new Set(bits.map((b) => b.replace(/\s*[*✱]\s*$/, "").replace(/\s*[*✱]\s+/g, " ").trim()).filter(Boolean))].join(" ").replace(LABEL_LONG, "$1 … $2");
   };
   // The question a checkbox or radio belongs to: the nearest label or legend above it that is not an option's own label.
+  const REQUIRED_WORDS = "Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório";
+  const REQUIRED_MARK = new RegExp(`[*✱]\\s*$|^\\s*[*✱]|[*✱]\\s*(${REQUIRED_WORDS})\\b`);
+  const REQUIRED_MARK_WORD = new RegExp(`\\s*[*✱]\\s*(${REQUIRED_WORDS})\\b`);
+  const groupRequired = new WeakSet();
   const groupQuestionFor = (el) => {
     const isOptionLabel = (l) => {
       if (l.contains(el) || (el.id && l.htmlFor === el.id)) return true;
       const target = l.htmlFor ? document.getElementById(l.htmlFor) : l.querySelector("input");
       return !!target && (target.type === "checkbox" || target.type === "radio");
     };
+    // A group that names itself (a fieldset's legend, or role=group with aria-labelledby, Workable) is the question of
+    // every option in it, the first one and the last one alike.
+    const own = el.closest("fieldset, [role=group], [role=radiogroup]");
+    if (own && ![...own.querySelectorAll("input, select, textarea")].some((i) => i.type !== "checkbox" && i.type !== "radio" && i.type !== "hidden")) {
+      const legend = own.querySelector(":scope > legend");
+      const named = (own.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((id) => text(document.getElementById(id))).filter(Boolean).join(" ");
+      // A group whose name points nowhere (Cornerstone: aria-labelledby to a missing id) is named by the words drawn
+      // just above it, inside the block that holds only it.
+      let above = "";
+      for (let box = own.parentElement, d = 0; !legend && !named && box && box !== document.body && d < 4 && !above; box = box.parentElement, d++) {
+        // A block that also holds another question is too wide to name this group.
+        if (box.querySelector("input:not([type=checkbox]):not([type=radio]):not([type=hidden]), select, textarea") || [...box.querySelectorAll("fieldset, [role=group], [role=radiogroup]")].some((g) => g !== own && !own.contains(g) && !g.contains(own))) break;
+        const all = text(box);
+        const mine = text(own);
+        const at = all.indexOf(mine);
+        if (at > 0 && at + mine.length >= all.length - 2) above = all.slice(0, at).trim();
+      }
+      const q = (legend && text(legend)) || named || (above.length <= 300 ? above : "");
+      if (q) {
+        if (REQUIRED_MARK.test(q) || own.getAttribute("aria-required") === "true") groupRequired.add(el);
+        return q.replace(REQUIRED_MARK_WORD, "").replace(/^\s*[*✱]\s*|\s*[*✱]\s*$/g, "").replace(LABEL_LONG, "$1 … $2");
+      }
+    }
     let cur = el.parentElement;
     for (let depth = 0; cur && cur !== document.body && depth < 5; depth++, cur = cur.parentElement) {
       // A container that holds a whole form section is too wide to say which question this option answers.
       if (cur.querySelectorAll("input:not([type=checkbox]):not([type=radio]):not([type=hidden]), select, textarea").length > 1) break;
       const before = [...cur.querySelectorAll("legend, label, [class*=question-title i]")].filter((l) => !isOptionLabel(l) && text(l) && (l.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
-      if (before.length) return text(before[before.length - 1]).replace(/\s*[*✱]\s*$/, "").slice(0, LABEL_MAX);
+      if (before.length) {
+        const q = text(before[before.length - 1]);
+        // A question that carries the mark of a required one, a star or the word ("Che tipo di contratto?* Requis").
+        if (REQUIRED_MARK.test(q)) groupRequired.add(el);
+        return q.replace(REQUIRED_MARK_WORD, "").replace(/\s*[*✱]\s*$/, "").replace(LABEL_LONG, "$1 … $2");
+      }
     }
     return "";
   };
@@ -313,23 +348,30 @@
         if (h && sib.querySelectorAll("input, select, textarea").length === 0) return text(h).slice(0, 80);
         sib = sib.previousElementSibling;
       }
-      cur = cur.parentElement;
+      // A box inside a web component (SuccessFactors' date pickers) goes on from the component on the page.
+      cur = cur.parentElement || (cur.getRootNode() instanceof ShadowRoot ? cur.getRootNode().host : null);
     }
     return "";
   };
   // A field that says it is optional is optional, whatever the box around it is called.
   // A drawn picker keeps the real, required input out of sight in the same box (Workable's comboboxes).
-  const hiddenRequiredTwin = (el) => { const box = el.closest("[data-input-type], [data-ui], [class*=field i]"); return !!box && [...box.querySelectorAll("input[required], select[required]")].some((t) => t !== el && !visible(t)); };
+  // The box around the control, never the control itself (bootstrap-select's button carries the class "field"). The hidden
+  // select it draws may say required by its class only (inRecruiting: "selectpicker field multiple required").
+  const hiddenRequiredTwin = (el) => { const box = (el.parentElement || el).closest("[data-input-type], [data-ui], [class*=field i]"); return !!box && [...box.querySelectorAll("input[required], select[required], select.required")].some((t) => t !== el && !visible(t)); };
   const headingSaysRequired = (el) => { const h = fieldHeading(el); return !!h && (/required/i.test(String(h.className)) || /[*✱]\s*$|^\s*[*✱]/.test(text(h))); };
   // A box whose class says required. Angular's state classes on the whole form ("ng-valid-required") say nothing about one field.
-  const REQUIRED_CLASS = /^(?!ng-(in)?valid-required$|not-required$|non-required$).*required/i;
+  // A class that says the opposite ("nonRequired", "not-required", "no_required": SuccessFactors' optional rows) is not one.
+  const REQUIRED_CLASS = /^(?!ng-(in)?valid-required$|.*(non|not|no|un)[-_]?required).*required/i;
   const requiredClass = (el) => {
-    for (let cur = el; cur && cur.nodeType === 1 && cur.tagName !== "FORM" && cur !== document.body; cur = cur.parentElement)
+    for (let cur = el; cur && cur.nodeType === 1 && cur.tagName !== "FORM" && cur !== document.body; cur = cur.parentElement) {
+      // The nearest box that says optional settles it: a wider box around it marked required speaks for other rows.
+      if ([...cur.classList].some((c) => /(non|not|no|un)[-_]?required/i.test(c))) return false;
       if ([...cur.classList].some((c) => REQUIRED_CLASS.test(c))) return true;
+    }
     return false;
   };
   // Some boards write the word instead of a star: "Indirizzo Obbligatorio", "Address Required".
-  const isRequired = (el, label) => !/\(optional\)|\(facoltativo\)/i.test(label) && (/(^|\s)(Obbligatorio|Required|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)(\s|\.|$)/.test(label) || /^\s*(obbligatorio|required)\b/i.test(label) || el.required || el.getAttribute("aria-required") === "true" || /[*✱]\s*$|^\s*[*✱]|\(required\)/i.test(label) || requiredClass(el) || hiddenRequiredTwin(el) || headingSaysRequired(el));
+  const isRequired = (el, label) => !/\(optional\)|\(facoltativo\)/i.test(label) && (/\((required|obbligatorio|erforderlich|pflichtfeld|obligatoire|obligatorio|obrigatório|requis)\)/i.test(label) || /(^|\s)(Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)(\s|\.|$)/.test(label) || /^\s*(obbligatorio|required)\b/i.test(label) || el.required || el.getAttribute("aria-required") === "true" || /[*✱]\s*$|^\s*[*✱]|\(required\)/i.test(label) || requiredClass(el) || hiddenRequiredTwin(el) || headingSaysRequired(el));
 
   // A plain text input with a suggestion list beside it (Lever's location box) only accepts a picked suggestion.
   const hasSuggestBox = (el) => el.tagName === "INPUT" && !!el.parentElement && !!el.parentElement.querySelector('[class*="dropdown-results" i], [class*="autocomplete" i], [class*="typeahead" i], [class*="suggestions" i]');
@@ -375,6 +417,8 @@
   }).filter(Boolean);
   const inPanel = (el) => panelRoots.some((r) => r.contains(el)) && !isPanel(el);
   const containerOf = (el) => el.closest("fieldset, [class*=field i], [class*=question i], [data-field-path], [id^=question], .form-group") || el.parentElement;
+  // One part of a date drawn as a spin box: Workday names it "dateSectionYear" and labels it Year / Month / Day.
+  const DATE_SPIN = /dateSection|\b(year|month|day|anno|mese|giorno)\b/i;
   const usedContainers = new Set();
   const dumped = new Set();
   const elementOf = new Map();
@@ -385,9 +429,12 @@
     if (SKIP_TYPES.has(type) && !el.matches(MENU_BUTTON)) return;
     if (inPanel(el)) return;
     // One part of a date drawn as boxes per part: the whole date is read as one field below.
-    if (el.getAttribute("role") === "spinbutton" && el.closest("[role=group]") && el.closest("[role=group]").querySelectorAll("input[role=spinbutton]").length >= 2) return;
+    // Workday's education years are a group of one part ("From": YYYY), read below as the date it is.
+    if (el.getAttribute("role") === "spinbutton" && el.closest("[role=group]") && (el.closest("[role=group]").querySelectorAll("input[role=spinbutton]").length >= 2 || DATE_SPIN.test(`${el.id} ${el.getAttribute("aria-label") || ""}`))) return;
     // The site's own header and menus (a language picker, the signed-in account's menu) are not questions of the form.
     if (el.closest("header, nav, [role=banner], [role=navigation], [data-automation-id=header]") && !el.closest("form")) return;
+    // A language picker drawn in the page body, outside the form, reloads the page in another language and empties it.
+    if (el.matches(MENU_BUTTON) && !el.closest("form") && document.querySelector("form") && /^\s*(english|français|francais|italiano|deutsch|español|espanol|português|portugues|nederlands|polski|svenska|dansk|norsk|suomi|čeština|română|magyar|türkçe|ελληνικά|русский|日本語|中文|한국어|en|fr|it|de|es|pt|nl)\s*$/i.test(el.innerText || "")) return;
     // Workday's prompt: the list of its picks and its open list of rows belong to its search box, not questions of their own.
     if (el.getAttribute("role") === "listbox" && el.closest("[data-automation-id=multiSelectContainer], [data-automation-id=activeListContainer], [data-automation-id=selectedItemList]")) return;
     if (el.getAttribute("data-automation-id") === "activeListContainer" || el.closest("[data-automation-id=activeListContainer]")) return;
@@ -429,6 +476,7 @@
     else if (type === "checkbox") kind = "checkbox";
     else if (type === "file") kind = "file";
     else if (["email", "tel", "url", "number", "date"].includes(type)) kind = type;
+    else if (type === "range") kind = "number";
     else kind = "text";
 
     const f = {
@@ -458,13 +506,20 @@
       const own = el.nextElementSibling && !el.nextElementSibling.matches("input, select, textarea") ? text(el.nextElementSibling) : text(el.closest("label") || document.createElement("i"));
       if (/[*✱]\s*$/.test(own)) f.required = true;
     }
+    // A box of a group whose question is required: one of the group must be ticked, not every one.
+    if (kind === "checkbox" && !f.required && groupRequired.has(el)) f.groupRequired = true;
+    // A slider (Teamtailor's "range" questions) takes a number between its ends, not words.
+    if (type === "range") {
+      f.widget = "range";
+      f.hint = `${f.hint} (a number from ${el.min || 0} to ${el.max || 100}${el.step && el.step !== "1" ? `, in steps of ${el.step}` : ""})`.trim();
+    }
     f.label = f.label.replace(/\s*[*✱]\s*$/, "");
     if (f.widget === "panel") {
       // The form's label names the switched-off box inside, not the combobox around it ("Geolocation Combobox").
       const inner = el.querySelector("input:not([type=hidden]), select, textarea");
       const lab = inner && inner.id ? document.querySelector(`label[for="${cssEscape(inner.id)}"]`) : null;
       if (lab) {
-        f.label = text(lab).slice(0, LABEL_MAX);
+        f.label = text(lab).replace(LABEL_LONG, "$1 … $2");
         f.required = f.required || lab.classList.contains("required") || /[*✱]\s*$/.test(text(lab));
       }
       f.value = inner ? inner.value : "";
@@ -502,7 +557,7 @@
         named = questionFor(el) || "";
       }
       if (!named && bare(f.label) === "") f.label = questionFor(el) || f.label;
-      f.label = (named || f.label).slice(0, LABEL_MAX);
+      f.label = (named || f.label).replace(LABEL_LONG, "$1 … $2");
       f.value = shownNow;
       f.required = f.required || isRequired(el, f.label);
     }
@@ -512,7 +567,20 @@
       // A stand-in box made for an upload button already carries the button's own required mark; the words around it
       // can hold another box's star (SuccessFactors: "* CV" above "Cover letter").
       if (el.hasAttribute("data-awj-proxy")) f.required = el.hasAttribute("data-awj-required");
-      else f.required = f.required || /[*✱]\s*$/.test(fileQuestion(el));
+      // The star or the word can close the question ("Arbeitszeugnis* (erforderlich)", Personio).
+      else f.required = f.required || /[*✱]\s*$|[*✱]?\s*\((required|obbligatorio|erforderlich|pflichtfeld|obligatoire|obligatorio|obrigatório|requis)\)\s*$/i.test(fileQuestion(el));
+      // A box that takes only videos is a question answered on camera (Teamtailor: "What motivated you to apply?*
+      // Required", then "Allow camera and microphone access"). It is named by its question, and required by its mark.
+      const accept = (el.getAttribute("accept") || "").toLowerCase();
+      if (accept && accept.split(",").every((x) => /video\/|\.(mp4|mpe?g|avi|mov|mkv|wmv|ogv|webm|flv|m4v)$/.test(x.trim()))) {
+        f.widget = "video";
+        const block = el.closest(".question, [class*=question i], fieldset");
+        const head = block ? text(block).split(/\s*(?:Allow camera|Consenti|Autoriser|Kamera)/i)[0] : "";
+        if (head) {
+          if (/[*✱]\s*(Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)?\s*$/.test(head)) f.required = true;
+          f.label = `${head.replace(/\s*[*✱]\s*(Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)?\s*$/, "")} (a video answer)`.replace(LABEL_LONG, "$1 … $2");
+        }
+      }
     }
 
     if (kind === "radio") {
@@ -532,7 +600,7 @@
       const fs = el.closest("fieldset, [role=radiogroup]");
       const named = fs && fs.getAttribute("aria-labelledby") ? fs.getAttribute("aria-labelledby").split(/\s+/).map((id) => text(document.getElementById(id))).filter(Boolean).join(" ") : "";
       if (fs && fs.querySelector("legend")) f.label = text(fs.querySelector("legend")) || f.label;
-      else if (named) f.label = named.slice(0, LABEL_MAX);
+      else if (named) f.label = named.replace(LABEL_LONG, "$1 … $2");
       else if (!f.label || f.options.some((o) => o.label === f.label)) {
         let cur = el.parentElement, depth = 0;
         while (cur && depth < 5) { const l = cur.querySelector("legend, label, [class*=label i], h2, h3, h4"); if (l && text(l) && !f.options.some((o) => o.label === text(l))) { f.label = text(l); break; } cur = cur.parentElement; depth++; }
@@ -544,6 +612,18 @@
       if (box && box.getAttribute("aria-required") === "true") f.required = true;
       // The question itself may carry the mark, before or after the words.
       if (/^\s*[*✱]|[*✱]\s*$/.test(f.label) || /^\s*[*✱]/.test(f.section)) f.required = true;
+      // Or the word after it (Teamtailor: "Hai esperienza…?* Obbligatorio").
+      const REQUIRED_TAIL = /\s*[*✱]?\s*(Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)\s*$/;
+      if (REQUIRED_TAIL.test(f.label)) { f.required = true; f.label = f.label.replace(REQUIRED_TAIL, ""); }
+      // Or a star and the word in the middle, with the question's hint after them ("Cerchi uno stage?* Obbligatorio
+      // Potremmo contattarti per…"): read as the end of the question, with the hint kept after it.
+      const REQUIRED_MID = /\s*[*✱]\s*(Obbligatorio|Required|Requis|Requerido|Erforderlich|Pflichtfeld|Obligatoire|Obligatorio|Obrigatório)\b\s*/;
+      if (REQUIRED_MID.test(f.label)) { f.required = true; f.label = f.label.replace(REQUIRED_MID, " ").trim(); }
+      // A group named only by one of its options ("Yes") is named by its question.
+      if (f.options.some((o) => o.label === f.label) && f.section && !f.options.some((o) => o.label === f.section)) f.label = f.section.replace(LABEL_LONG, "$1 … $2");
+      // Accepting the privacy notice is never optional, starred or not (Cornerstone at Linde: "I accept the Linde
+      // recruitment privacy notice…" Yes / No, and "Please acknowledge… by clicking Yes" after Submit).
+      if (/privacy|informativa|datenschutz|confidentialité|privacidad/i.test(f.label) && /\b(i accept|accept|acknowledge|confirm|accetto|dichiaro|presa visione|akzeptiere|bestätige|j'accepte|acepto)\b/i.test(f.label) && f.options.some((o) => /^(yes|sì|si|ja|oui|sí)$/i.test(o.label))) f.required = true;
       f.label = f.label.replace(/^\s*[*✱]\s*|\s*[*✱]\s*$/g, "");
     } else if (kind === "select") {
       [...el.options].forEach((o) => { if (o.value !== "" || o.text.trim()) f.options.push({ value: o.value, label: o.text.trim() }); });
@@ -551,6 +631,10 @@
     } else if (kind === "checkbox") {
       f.checked = el.checked;
       f.value = el.value;
+      // One box that accepts the terms or the privacy notice is never optional, starred or not (Manatal: "I agree to
+      // the terms and conditions & privacy policy", refused after Submit). Consent to marketing or to be contacted
+      // about other openings stays optional.
+      if (/\b(terms|termini|condizioni|conditions|privacy|informativa|datenschutz|confidentialité|privacidad|agb)\b/i.test(f.label) && /\b(i agree|agree|i accept|accept|acknowledge|accetto|acconsento|dichiaro|presa visione|akzeptiere|stimme|j'accepte|acepto)\b/i.test(f.label) && !/marketing|newsletter|commercial|promozional|ricontatt|future|other (positions|openings|opportunities)|altre (posizioni|opportunità)|talent pool|searchable/i.test(f.label)) f.required = true;
     } else if (kind === "combobox") {
       // Workday's prompt keeps its picks as items beside a search box that stays empty.
       const box = el.getAttribute("data-uxi-widget-type") === "selectinput" && el.closest("[data-automation-id=multiSelectContainer]");
@@ -602,7 +686,7 @@
       selector: groupSelectorFor(c),
       kind: "radio",
       name: c.getAttribute("data-field-path") || "",
-      label: label.replace(/\s*[*✱]\s*$/, "").replace(/^\s*[*✱]\s*/, "").slice(0, LABEL_MAX),
+      label: label.replace(/\s*[*✱]\s*$/, "").replace(/^\s*[*✱]\s*/, "").replace(LABEL_LONG, "$1 … $2"),
       hint: hintFor(c),
       placeholder: "",
       required: /required/i.test(labelEl?.className || "") || /[*✱]\s*$|^\s*[*✱]/.test(labelEl ? text(labelEl) : label) || c.getAttribute("aria-required") === "true" || !!c.querySelector('[aria-required="true"], input[required]'),
@@ -621,7 +705,7 @@
   deepAll("[role=group]").forEach((g) => {
     const spins = [...g.querySelectorAll("input[role=spinbutton]")];
     // Only the group that holds the parts itself, not a section around it.
-    if (spins.length < 2 || !visible(g) || g.querySelector(":scope [role=group] input[role=spinbutton]")) return;
+    if (!(spins.length >= 2 || (spins.length === 1 && DATE_SPIN.test(`${spins[0].id} ${spins[0].getAttribute("aria-label") || ""}`))) || !visible(g) || g.querySelector(":scope [role=group] input[role=spinbutton]")) return;
     const box = g.closest("fieldset");
     const legend = box && box.querySelector("legend");
     const raw = legend ? text(legend) : questionFor(g) || "";
@@ -631,7 +715,7 @@
       selector: groupSelectorFor(g),
       kind: "date",
       name: "",
-      label: raw.replace(/\s*[*✱]\s*$/, "").slice(0, LABEL_MAX),
+      label: raw.replace(/\s*[*✱]\s*$/, "").replace(LABEL_LONG, "$1 … $2"),
       hint: "",
       placeholder: spins.map((s) => s.getAttribute("aria-label") || "").join(" / "),
       required: /[*✱]\s*$/.test(raw) || spins.some((s) => s.getAttribute("aria-required") === "true"),
@@ -644,6 +728,25 @@
       buttonGroup: false,
     });
   });
+
+  // Boxes of one entry block that all took the block's question as their label (Manatal's "Add Experience": Position
+  // name, Employer, Start Date…, each named only by its placeholder) are named by their own placeholder, or by a
+  // select's prompt option; the question becomes their section, and a star in the placeholder marks one required.
+  const OWN_NAMED = new Set(["text", "textarea", "select", "number", "email", "tel", "url"]);
+  const byLabel = new Map();
+  for (const f of fields) if (f.label && (OWN_NAMED.has(f.kind) || f.widget === "calendar")) byLabel.set(f.label, [...(byLabel.get(f.label) ?? []), f]);
+  for (const [label, same] of byLabel) {
+    if (same.length < 3) continue;
+    const ownName = (f) => f.placeholder || (f.kind === "select" && f.options[0] && !f.options[0].value ? f.options[0].label : "");
+    if (same.filter((f) => ownName(f)).length < same.length - 1) continue;
+    for (const f of same) {
+      const own = ownName(f);
+      if (!own) continue;
+      f.section = label;
+      f.required = /[*✱]\s*$/.test(own);
+      f.label = own.replace(/\s*[*✱]\s*$/, "");
+    }
+  }
 
   // The application is the <form> that holds the resume or the email box. A control that sits above
   // that form and outside it (a job-alert box, a site search) is not part of the application.
@@ -689,7 +792,10 @@
   const words = (b) => (text(b) || b.value || b.getAttribute("aria-label") || (inShadow(b) ? text(rootOf(b).host) : "") || "").trim();
   // "Apply with Indeed" and the like send the application through another site's account: never this form's Submit.
   const ELSEWHERE = /linkedin|indeed|google|facebook|xing|seek|apple|glassdoor/i;
-  const submitLike = (root) => deepAll("button, input[type=submit], [role=button], a[class*=submit i], a[class*=btn i]", root).filter((b) => SUBMIT_WORD.test(words(b)) && !ELSEWHERE.test(words(b)) && visible(b));
+  // A question or a long sentence on a button is an FAQ or accordion toggle ("I have applied for a position, what
+  // should I expect next?"), never the form's Submit or Next.
+  const notAction = (b) => /\?/.test(words(b)) || words(b).length > 60;
+  const submitLike = (root) => deepAll("button, input[type=submit], [role=button], a[class*=submit i], a[class*=btn i]", root).filter((b) => SUBMIT_WORD.test(words(b)) && !ELSEWHERE.test(words(b)) && !notAction(b) && visible(b));
   // The button may sit outside the form element (BambooHR draws it in a footer of its own), so the page is searched when the form has none.
   const buttons = form && submitLike(form).length ? submitLike(form) : submitLike(document);
   buttons.forEach((b) => {

@@ -104,7 +104,7 @@ describe("applyUrlFor", () => {
     const { applyUrlFor } = await import("../src/jobs/normalize.js");
     expect(applyUrlFor({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/pinterest/jobs/8138049" })).toBe("https://job-boards.greenhouse.io/embed/job_app?for=pinterest&token=8138049");
     expect(applyUrlFor({ ats: "greenhouse", url: "https://job-boards.eu.greenhouse.io/acme/jobs/4978937101" })).toBe("https://job-boards.eu.greenhouse.io/embed/job_app?for=acme&token=4978937101");
-    expect(applyUrlFor({ ats: "greenhouse", url: "https://stripe.com/jobs/search?gh_jid=8157838" })).toBe("https://stripe.com/jobs/search?gh_jid=8157838");
+    expect(applyUrlFor({ ats: "greenhouse", url: "https://stripe.com/jobs/search?gh_jid=8157838" })).toBe("https://boards.greenhouse.io/embed/job_app?token=8157838");
     expect(applyUrlFor({ ats: "lever", url: "https://jobs.lever.co/matchgroup/69396299-e587-4063-aef6-0ce2fd66e9ee" })).toBe("https://jobs.lever.co/matchgroup/69396299-e587-4063-aef6-0ce2fd66e9ee/apply");
     expect(applyUrlFor({ ats: "ashby", url: "https://jobs.ashbyhq.com/cohere/8c035d3d-081d-4c8a-914a-72f4efaad254" })).toBe("https://jobs.ashbyhq.com/cohere/8c035d3d-081d-4c8a-914a-72f4efaad254/application");
     expect(applyUrlFor({ ats: "other", url: "https://x/y" })).toBe("https://x/y");

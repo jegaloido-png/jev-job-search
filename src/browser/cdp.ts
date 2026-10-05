@@ -55,7 +55,34 @@ export async function newTab(url: string): Promise<Target> {
   return (await res.json()) as Target;
 }
 
+/**
+ * Closes a tab. A page with changes it has not saved asks "Leave site?" when it goes, and that dialog holds the window
+ * until someone answers it: the tab is closed through a connection of its own that accepts it.
+ */
 export async function closeTab(id: string): Promise<void> {
+  try {
+    const t = ((await fetch(`${base()}/json/list`).then((r) => r.json())) as Target[]).find((x) => x.id === id);
+    if (t?.webSocketDebuggerUrl) {
+      const ws = new WebSocket(t.webSocketDebuggerUrl);
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error("could not attach to the tab"));
+        setTimeout(() => reject(new Error("no answer")), 3_000);
+      });
+      let gone = false;
+      ws.onmessage = (ev: MessageEvent) => {
+        const m = JSON.parse(String(ev.data)) as { method?: string };
+        if (m.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: 3, method: "Page.handleJavaScriptDialog", params: { accept: true } }));
+      };
+      ws.onclose = () => (gone = true);
+      ws.send(JSON.stringify({ id: 1, method: "Page.enable" }));
+      ws.send(JSON.stringify({ id: 2, method: "Page.close" }));
+      for (let i = 0; i < 20 && !gone; i++) await sleep(100);
+      if (!gone) ws.close();
+    }
+  } catch {
+    // The tab may be gone already; the plain close below is enough then.
+  }
   await fetch(`${base()}/json/close/${id}`).catch(() => undefined);
 }
 
@@ -117,6 +144,8 @@ export class Page {
   private inflight = new Set<string>();
   /** The address of the page itself, kept current so a widget's own frame is not mistaken for the form. */
   private mainUrl = "";
+  /** True while fields are being filled: a page that then asks "Leave site?" stays on the form (a click that would leave it lost RINA's form). */
+  stayOnPage = false;
   private constructor(private ws: WebSocket, readonly targetId: string) {}
 
   static async attach(target: Target): Promise<Page> {
@@ -129,6 +158,16 @@ export class Page {
     ws.onmessage = (ev: MessageEvent) => {
       const m = JSON.parse(String(ev.data)) as { id?: number; result?: unknown; error?: { message: string }; method?: string; params?: Record<string, unknown> };
       if (m.id === undefined) {
+        // A page dialog ("Leave site? Changes you made may not be saved", an alert, a confirm) holds the whole tab until it
+        // is answered: every later call on the page would wait for it. It answers the step the run itself took, so it is
+        // accepted.
+        if (m.method === "Page.javascriptDialogOpening") {
+          const d = m.params as { type?: string; message?: string } | undefined;
+          const stay = d?.type === "beforeunload" && page.stayOnPage;
+          if (process.env.AWJ_TRACE) console.error(`[fill] page dialog (${d?.type ?? "?"}): "${String(d?.message ?? "").slice(0, 120)}": ${stay ? "stayed on the form" : "accepted"}`);
+          page.send("Page.handleJavaScriptDialog", { accept: !stay }).catch(() => undefined);
+          return;
+        }
         if (m.method && m.params) page.onNetwork(m.method, m.params);
         return;
       }

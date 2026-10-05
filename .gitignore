@@ -33,4 +33,4 @@ npm-debug.log*
 coverage/
 
 # accounts made on careers sites (passwords)
-data/accounts.json
+data/accounts*

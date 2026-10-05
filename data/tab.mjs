@@ -51,5 +51,13 @@ if (cmd === "click") {
     console.log("after:", (await ev("location.href")).slice(0, 160));
   }
 }
+// node data/tab.mjs type <match> <css selector> <text>: focuses the box and types the text key by key, then waits 3 s.
+if (cmd === "type") {
+  await send("Page.bringToFront");
+  await ev(`(() => { const e = document.querySelector(${JSON.stringify(a1)}); e.scrollIntoView({ block: "center" }); e.focus(); e.value = ""; return 1; })()`);
+  for (const ch of a2) { await send("Input.dispatchKeyEvent", { type: "keyDown", text: ch }); await send("Input.dispatchKeyEvent", { type: "keyUp" }); await sleep(80); }
+  await sleep(3000);
+  console.log("typed");
+}
 if (cmd === "eval") console.log(JSON.stringify(await ev(a1), null, 1)?.slice(0, 4000));
 ws.close();
