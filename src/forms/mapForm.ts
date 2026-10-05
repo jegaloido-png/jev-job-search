@@ -369,7 +369,9 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
       }
     }
   }
-  const coverText = policy.cover ? (docs?.coverText ?? null) : null;
+  // A letter the profile carries (written elsewhere for this job) stands in when this run writes none.
+  const given = policy.cover ? null : (profile.coverLetter ?? null);
+  const coverText = policy.cover ? (docs?.coverText ?? null) : (given?.text ?? null);
   dump.fields.forEach((f) => {
     if (f.kind !== "textarea" || resolvedInCode.has(f.id) || !coverText || !COVER_LABEL.test(`${f.label} ${f.name} ${f.hint}`)) return;
     planned.push({ id: f.id, selector: f.selector, kind: f.kind, label: f.label, required: f.required, optionLabel: null, action: "fill", key: "cover_letter", value: f.maxLength ? coverText.slice(0, f.maxLength) : coverText, confidence: 1, note: "the cover letter written for this job" });
@@ -413,7 +415,7 @@ async function mapFormFresh(jev: JevClient, profile: Profile, job: Job, dump: Fi
     const graduate = profile.education.some((e) => /master|\bm\.?sc?\b|\bmba\b|ph\.?d|doctor/i.test(e.degree));
     const file =
       want === "resume" ? (policy.resume ? (docs?.resume ?? null) : profile.resume.path)
-      : want === "cover" ? (policy.cover && docs?.cover ? docs.cover : null)
+      : want === "cover" ? (policy.cover && docs?.cover ? docs.cover : (given?.path ?? null))
       : want === "transcript" || (want === "graduate_transcript" && graduate) ? (profile.transcript?.path ?? null)
       // A photo goes in whenever the form has a box for one (owner's rule) and the profile holds one.
       : want === "photo" ? (profile.photo?.path ?? null)

@@ -136,6 +136,12 @@ export const ProfileSchema = z.object({
   transcript: z.object({ path: z.string() }).optional(),
   /** A photo of the candidate, attached to any box that asks for one. Leave it out and a form that requires one is held. */
   photo: z.object({ path: z.string() }).optional(),
+  /**
+   * A cover letter written elsewhere for the job being applied to (a service that writes its own documents and runs
+   * one job at a time): the file goes in a cover letter box, the text in a cover letter text box. Used only when
+   * this run writes no letter of its own.
+   */
+  coverLetter: z.object({ path: z.string().optional(), text: z.string().optional() }).optional(),
   /** Three or four sentences used as the candidate side of every JEV rating call. */
   summary: z.string().min(40),
   /** Short facts Claude may use when drafting free text. Nothing outside this list is claimed. */

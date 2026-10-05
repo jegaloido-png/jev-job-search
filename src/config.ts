@@ -9,51 +9,58 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+/**
+ * Where one candidate's own files live: profile, answer memory, queue, site accounts, records and documents.
+ * JEV_HOME points a run at another candidate's folder (a service applying for many people runs one folder per
+ * person); without it they live in this project. What ships with the tool stays under ROOT.
+ */
+export const HOME = process.env.JEV_HOME ? path.resolve(process.env.JEV_HOME) : ROOT;
+
 export const PATHS = {
   root: ROOT,
-  data: path.join(ROOT, "data"),
-  profile: path.join(ROOT, "data", "profile.json"),
+  data: path.join(HOME, "data"),
+  profile: path.join(HOME, "data", "profile.json"),
   profileExample: path.join(ROOT, "data", "profile.example.json"),
   /** The style guide for written answers. data/voice.local.md, when present, is the candidate's own and wins over the shipped one. */
-  voice: existsSync(path.join(ROOT, "data", "voice.local.md")) ? path.join(ROOT, "data", "voice.local.md") : path.join(ROOT, "data", "voice.md"),
-  bank: path.join(ROOT, "data", "bank.json"),
+  voice: existsSync(path.join(HOME, "data", "voice.local.md")) ? path.join(HOME, "data", "voice.local.md") : path.join(ROOT, "data", "voice.md"),
+  bank: path.join(HOME, "data", "bank.json"),
   bankExample: path.join(ROOT, "data", "bank.example.json"),
-  queue: path.join(ROOT, "data", "queue.json"),
+  queue: path.join(HOME, "data", "queue.json"),
   /** Every job the tool considered, with what happened to it. */
   /** The four records a person reads, in one folder at the top of the project: applications/. */
-  applications: path.join(ROOT, "applications", "all.csv"),
+  applications: path.join(HOME, "applications", "all.csv"),
   /** Only the applications that were sent, newest first. It sits at the top of the folder so it is easy to find. */
-  applied: path.join(ROOT, "applications", "applied.csv"),
+  applied: path.join(HOME, "applications", "applied.csv"),
   /** Answers the writer has given before, kept so the same question is not paid for twice. */
-  memory: path.join(ROOT, "data", "memory.json"),
-  cache: path.join(ROOT, "data", "cache"),
+  memory: path.join(HOME, "data", "memory.json"),
+  cache: path.join(HOME, "data", "cache"),
   /** What every user's runs have taught the tool about sites. Shipped with the repository. */
   knowledgeShipped: path.join(ROOT, "knowledge", "sites.json"),
   /** What this machine's runs have learned since. Merged with the shipped notes on reading. */
   knowledgeLocal: path.join(ROOT, "data", "knowledge.json"),
   /** Left by earlier versions: sites found behind a sign-in. Read once more and folded into the notes above. */
-  walledHosts: path.join(ROOT, "data", "cache", "walled-hosts.json"),
+  walledHosts: path.join(HOME, "data", "cache", "walled-hosts.json"),
   /** JEV's ratings of postings, kept so an unchanged posting is not rated again. */
-  ratings: path.join(ROOT, "data", "cache", "ratings.json"),
+  ratings: path.join(HOME, "data", "cache", "ratings.json"),
   /** JEV's field mappings of forms, kept so an unchanged form is not mapped again. */
-  plans: path.join(ROOT, "data", "cache", "plans.json"),
+  plans: path.join(HOME, "data", "cache", "plans.json"),
   /** Jobs the tool could not finish and left for the person, with the reason and the link. */
-  manual: path.join(ROOT, "applications", "manual.csv"),
+  manual: path.join(HOME, "applications", "manual.csv"),
   /** Applications sent to a company that also wants a take-home assignment: the link and the instructions, for the person to do. */
-  takehome: path.join(ROOT, "applications", "takehome.csv"),
+  takehome: path.join(HOME, "applications", "takehome.csv"),
   /** How many applications have gone out since the runner's browsing data was last cleared. */
   browsing: path.join(ROOT, "data", "runs", "browsing.json"),
-  runs: path.join(ROOT, "data", "runs"),
-  jevUsage: path.join(ROOT, "data", "runs", "jev-usage.jsonl"),
-  writerUsage: path.join(ROOT, "data", "runs", "writer-usage.jsonl"),
-  imports: path.join(ROOT, "data", "imports"),
+  runs: path.join(HOME, "data", "runs"),
+  jevUsage: path.join(HOME, "data", "runs", "jev-usage.jsonl"),
+  writerUsage: path.join(HOME, "data", "runs", "writer-usage.jsonl"),
+  imports: path.join(HOME, "data", "imports"),
   /** Tailored resumes and cover letters, one folder per job: documents/tailored/<Company>_<Role>_<job id>/. */
-  documents: path.join(ROOT, "documents", "tailored"),
+  documents: path.join(HOME, "documents", "tailored"),
   /** The person's own files, at the top of the project: the resume to send, a transcript, and the tailored pairs under tailored/. */
-  documentsDir: path.join(ROOT, "documents"),
+  documentsDir: path.join(HOME, "documents"),
   browserScripts: path.join(ROOT, "src", "forms"),
   /** The accounts made on careers sites that want one before the form: site, company, email and password. Never committed. */
-  accounts: path.join(ROOT, "data", "accounts.json"),
+  accounts: path.join(HOME, "data", "accounts.json"),
 } as const;
 
 /** Loads KEY=value lines from .env into process.env without overriding existing values. */
@@ -310,9 +317,9 @@ export const DOCUMENTS = {
   printTimeoutMs: 30_000,
   /** The stock templates shipped with the tool, and where a person's own go. */
   templatesShipped: path.join(ROOT, "src", "documents", "templates"),
-  templatesLocal: path.join(ROOT, "documents", "templates"),
+  templatesLocal: path.join(HOME, "documents", "templates"),
   /** Which template is in use, kept in data/. */
-  activeTemplate: path.join(ROOT, "data", "template.json"),
+  activeTemplate: path.join(HOME, "data", "template.json"),
   /** Words that may be capitalized in a sentence without being a claim about the candidate. */
   plainWords: ["I", "A", "An", "The", "My", "In", "At", "On", "For", "With", "And", "As", "To", "Of", "This", "That", "It", "We", "You", "Your", "Our", "If", "When", "While", "After", "Before", "Over", "Since", "Through", "Then", "There", "Here", "What", "Which", "Who", "How", "Why", "Yes", "No", "Dear", "Hi", "Hello", "Sincerely", "Best", "Regards", "Thank", "Thanks", "Team", "Hiring", "Manager", "Regarding", "Re",
     // Italian sentence openers and letter words, so an Italian letter is not read as naming things the profile lacks.

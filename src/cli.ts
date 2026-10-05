@@ -114,10 +114,13 @@ program
   .option("--tailor", "write a resume for each job from your profile and attach that one instead of your file")
   .option("--cover", "also write a cover letter for a form that has a box for one, as a file or as text")
   .option("--batch <file>", "apply to the postings of a batch file, one \"tag|url|company|title|city\" line each, in order, on any board")
+  .option("--result <file>", "write each job's outcome to this file as JSON: id, link, status and reason, for a program that runs jev")
   .option("--json")
-  .action(async (given: string[], o: ApplyOptions & { batch?: string }) => {
+  .action(async (given: string[], o: ApplyOptions & { batch?: string; result?: string }) => {
     documentsFromOptions(o);
     const ids = await idsFromLinks(given);
+    // Batch jobs found already applied are not run again, but their outcome is still reported.
+    const alreadyApplied: string[] = [];
     if (o.batch) {
       const jev = new JevClient();
       const profile = loadProfile();
@@ -126,6 +129,7 @@ program
           const e = await addBatchJob(jev, profile, line);
           console.log(`${e.job.id}  ${e.job.company} | ${e.job.title}${e.status === "applied" ? "  (already applied)" : ""}`);
           if (e.status !== "applied") ids.push(e.job.id);
+          else alreadyApplied.push(e.job.id);
         } catch (err) {
           console.log(`batch: ${line.split("|")[0]} not queued: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -142,6 +146,13 @@ program
       console.log(`\n${count("applied")} applied, ${count("needs_review", "blocked")} left for you, ${count("skipped", "failed")} skipped, ${count("in_progress")} filled and waiting for submit`);
       if (codes) console.log(`${codes} form(s) stopped at a human check (an emailed code or a robot check). They are in applications/manual.csv; apply to those by hand, or try them again later.`);
       console.log(whereTheRecordIs());
+      if (o.result) {
+        const outcomes = [...alreadyApplied, ...ids].map((id) => {
+          const e = done.get(id);
+          return { id, url: e?.job.url ?? null, status: e?.status ?? "unknown", reason: e?.statusReason ?? null };
+        });
+        writeFileSync(o.result, JSON.stringify(outcomes, null, 1));
+      }
     }
     if (!o.json) console.log(`\nCost of this run\n${formatCost(loadCost(began))}`);
     endIfAbandoned();
